@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod pip;
 
 use crate::{is_game_connection, Client, Connection, GameProfile, Identity, Snapshot, Window};
 use std::{
@@ -10,7 +11,8 @@ use std::{
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::{
     Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME, HANDLE, HWND, LPARAM,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME,
+        HANDLE, HWND, LPARAM,
     },
     NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCP6ROW_OWNER_MODULE, MIB_TCP6TABLE_OWNER_MODULE,
@@ -27,7 +29,11 @@ use windows::Win32::{
             PROCESS_QUERY_LIMITED_INFORMATION,
         },
     },
-    UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindowVisible},
+    UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, WS_EX_TOPMOST,
+    },
 };
 
 pub(super) struct OwnedHandle(HANDLE);
@@ -273,11 +279,62 @@ unsafe extern "system" fn enum_window(hwnd: HWND, param: LPARAM) -> BOOL {
                 windows.push(Window {
                     hwnd: hwnd.0 as usize,
                     minimized: IsIconic(hwnd).as_bool(),
+                    topmost: is_topmost(hwnd),
                 });
             }
         }
     }
     BOOL(1)
+}
+
+fn is_topmost(hwnd: HWND) -> bool {
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
+}
+
+/// Pin a client's windows above every normal window (or unpin them), like PowerToys
+/// "Always on Top". Only changes z-order: never moves, resizes, focuses or sends input to
+/// the game. Each HWND is re-checked to still belong to `pid`, since a closed window's
+/// handle can be reused by another program.
+pub fn set_topmost(pid: u32, hwnds: &[usize], on: bool) -> Result<(), String> {
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let mut changed = 0;
+    for &raw in hwnds {
+        let hwnd = HWND(raw as *mut _);
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
+        if owner != pid {
+            continue;
+        }
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        }
+        .map_err(|e| {
+            if e.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                "the game runs as administrator; run GamePulse as administrator too".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        // UIPI can drop the change without an error, so trust the style, not the return value
+        if is_topmost(hwnd) != on {
+            return Err(
+                "Windows ignored the request (is the game running as administrator?)".into(),
+            );
+        }
+        changed += 1;
+    }
+    if changed == 0 {
+        return Err("the game window has closed".into());
+    }
+    Ok(())
 }
 
 /// Check every game in `games` at once: cost barely depends on the number of games, since processes and the TCP table are walked once

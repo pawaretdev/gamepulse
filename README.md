@@ -10,6 +10,7 @@ A small Windows tray app that watches your game clients and alerts your phone th
 - Alerts through **ntfy**, a **Discord** webhook or a **Telegram** bot, and repeats until the client is back
 - Never reads game memory, clicks anything or touches your account
 - Keeps watching from the system tray when you close the window
+- Pin a game window on top, or keep it in a floating picture-in-picture view while you work
 
 <p align="center">
   <img src="docs/library.png" width="49%" alt="GamePulse game library with alerts on and both clients online">

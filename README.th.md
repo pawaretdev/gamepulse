@@ -10,6 +10,7 @@
 - เตือนผ่าน **ntfy**, **Discord** webhook หรือ **Telegram** bot และเตือนซ้ำจนกว่า client จะกลับมา
 - ไม่อ่าน memory เกม ไม่คลิกอะไรแทน และไม่แตะ account
 - ปิดหน้าต่างแล้วยังเฝ้าต่อใน system tray
+- ตรึงหน้าต่างเกมไว้บนสุด หรือย่อเป็นจอเล็กลอยแบบภาพซ้อนภาพ ทำงานไปดูเกมไปได้
 
 <p align="center">
   <img src="docs/library.png" width="49%" alt="หน้า library ของ GamePulse เปิดเตือนไว้และ client ออนไลน์ทั้งคู่">

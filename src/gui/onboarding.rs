@@ -494,6 +494,8 @@ pub(super) fn show_guide(context: &egui::Context, open: &mut bool) -> bool {
                     legend(ui, "INTERNET DOWN", p().red, "This PC cannot reach the internet.");
                     legend(ui, "PAUSED", p().grey, "Not watching. Press Start watching.");
                     hint(ui, "Each card shows the server address and how long the session has lasted, or how long it has been down.", p().muted);
+                    hint(ui, "The pin icon keeps that game window above your other apps (windowed or borderless mode only).", p().muted);
+                    hint(ui, "The picture-in-picture icon opens a small live view that floats above everything. Don't minimize the game; leave it behind your other apps.", p().muted);
                 });
                 guide_section(ui, "When you get alerted", false, |ui| {
                     bullet(ui, "Disconnected, game closed, client closed, internet down: urgent alert, repeated every few minutes.");

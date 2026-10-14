@@ -39,6 +39,8 @@ pub struct Client {
 pub struct Window {
     pub hwnd: usize,
     pub minimized: bool,
+    /// Always on top (`WS_EX_TOPMOST`), set by "Pin on top" or by the game itself
+    pub topmost: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

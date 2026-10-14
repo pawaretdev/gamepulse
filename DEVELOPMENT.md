@@ -155,6 +155,8 @@ The grace/repeat/burst/internet logic, alerts, Settings and tray have all moved 
 But phase 1 acceptance in the table above is not done: the API/session timestamps have not been fully compared against `Get-NetTCPConnection`,
 and capture has not been checked with multiple monitors / mixed DPI / lock screen / sleep-resume.
 There are no fake-clock regression tests for the state machine yet (phase 2); for now it is verified by real use on the game machine.
+"Pin on top" (`windows::set_topmost`) has not been tried on `rooc.exe` yet. Still to check: that the game doesn't reset its own z-order, the elevated-game error, and behaviour after a resolution change that recreates the window.
+Picture-in-picture (`windows::pip`, DWM thumbnail) has not been tried on `rooc.exe` either. Still to check: that the game keeps rendering while covered and unfocused, mixed-DPI monitors, and dragging a `WS_EX_NOACTIVATE` window.
 
 API sources: [GetExtendedTcpTable](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getextendedtcptable),
 [IPv6 ownership/timestamp](https://learn.microsoft.com/en-us/windows/win32/api/tcpmib/ns-tcpmib-mib_tcp6row_owner_module),

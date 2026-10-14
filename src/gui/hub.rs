@@ -666,6 +666,7 @@ pub(super) fn game_page(
     ui.add_space(12.0);
 
     let cards = engine.cards(game);
+    let mut clicked = None;
     ui.label(RichText::new("Clients").size(16.0).semibold());
     ui.add_space(4.0);
     egui::ScrollArea::vertical()
@@ -694,7 +695,11 @@ pub(super) fn game_page(
                     let columns = if ui.available_width() > 640.0 { 2 } else { 1 };
                     ui.columns(columns, |columns| {
                         for (index, card) in cards.iter().enumerate() {
-                            client_card(&mut columns[index % columns.len()], card);
+                            if let Some(card_action) =
+                                client_card(&mut columns[index % columns.len()], card)
+                            {
+                                clicked = Some((card.identity, card_action));
+                            }
                         }
                     });
                 }
@@ -709,6 +714,11 @@ pub(super) fn game_page(
             }
             snapshot_notes(ui, engine);
         });
+    match clicked {
+        Some((identity, CardAction::Pin(on))) => engine.set_pinned(identity, on),
+        Some((identity, CardAction::Pip(on))) => engine.set_pip(identity, on),
+        None => {}
+    }
     action
 }
 

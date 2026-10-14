@@ -208,6 +208,9 @@ struct AlertState {
     last_alert: Option<Instant>,
 }
 
+/// A finished "Pin on top" request: client, requested state, outcome
+type PinResult = (Identity, bool, Result<(), String>);
+
 /// All monitoring state; `tick()` is called by the worker thread every 250 ms whether the window is open or hidden
 struct Engine {
     config: Config,
@@ -222,6 +225,9 @@ struct Engine {
     no_process: HashMap<&'static str, AlertState>,
     last_heartbeat: Instant,
     jobs: Vec<Receiver<Vec<String>>>,
+    pins: Vec<Receiver<PinResult>>,
+    /// Open picture-in-picture windows (HWND as usize), one per client at most
+    pips: HashMap<Identity, usize>,
     internet_up: bool,
     internet_misses: u32,
     internet_alert: AlertState,
@@ -258,6 +264,8 @@ impl Engine {
             no_process: HashMap::new(),
             last_heartbeat: Instant::now(),
             jobs: Vec::new(),
+            pins: Vec::new(),
+            pips: HashMap::new(),
             internet_up: true,
             internet_misses: 0,
             internet_alert: AlertState::default(),
@@ -385,6 +393,15 @@ impl Engine {
                 self.jobs.remove(index);
             }
         }
+        for index in (0..self.pins.len()).rev() {
+            if let Ok((identity, on, result)) = self.pins[index].try_recv() {
+                self.pins.remove(index);
+                self.finish_pin(identity, on, result);
+            }
+        }
+        // Closed from the PiP itself (menu, double-click) or because the game window went away
+        self.pips
+            .retain(|_, hwnd| crate::windows::pip::is_open(*hwnd));
         let received = self.receiver.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some((snapshot, internet)) = received {
             self.internet_up = internet;
@@ -452,6 +469,96 @@ impl Engine {
             let _ = sender.send(job());
         });
         self.jobs.push(receiver);
+    }
+
+    /// Pin a client's game window on top of other windows (or unpin it). Runs on its own
+    /// thread: SetWindowPos waits on the game's message loop, which may be hung
+    fn set_pinned(&mut self, identity: Identity, on: bool) {
+        let Some(client) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.clients.iter().find(|c| c.identity == identity))
+        else {
+            return;
+        };
+        let hwnds: Vec<usize> = client.windows.iter().map(|w| w.hwnd).collect();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = crate::windows::set_topmost(identity.pid, &hwnds, on);
+            let _ = sender.send((identity, on, result));
+        });
+        self.pins.push(receiver);
+    }
+
+    /// Open or close a picture-in-picture view of a client's game window
+    fn set_pip(&mut self, identity: Identity, on: bool) {
+        if !on {
+            if let Some(hwnd) = self.pips.remove(&identity) {
+                crate::windows::pip::close(hwnd);
+            }
+            return;
+        }
+        let Some(client) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.clients.iter().find(|c| c.identity == identity))
+        else {
+            return;
+        };
+        let name = crate::find_game(client.game).map_or("Game", |g| g.name);
+        let Some(window) = client
+            .windows
+            .iter()
+            .find(|w| !w.minimized)
+            .or(client.windows.first())
+        else {
+            return;
+        };
+        let title = format!("{name} (PID {})", identity.pid);
+        match crate::windows::pip::open(identity.pid, window.hwnd, &title, self.pips.len()) {
+            Ok(hwnd) => {
+                self.pips.insert(identity, hwnd);
+                self.push(Level::Info, format!("Picture-in-picture: {title}"));
+            }
+            Err(error) => self.push(
+                Level::Warn,
+                format!("Cannot open picture-in-picture for {title}: {error}"),
+            ),
+        }
+    }
+
+    /// Show the new pin state right away instead of waiting for the next check
+    /// (which doesn't come at all while paused)
+    fn finish_pin(&mut self, identity: Identity, on: bool, result: Result<(), String>) {
+        let client = self
+            .snapshot
+            .as_mut()
+            .and_then(|s| s.clients.iter_mut().find(|c| c.identity == identity));
+        let name = client
+            .as_ref()
+            .and_then(|c| crate::find_game(c.game))
+            .map_or("Game", |g| g.name);
+        match result {
+            Ok(()) => {
+                if let Some(client) = client {
+                    for window in &mut client.windows {
+                        window.topmost = on;
+                    }
+                }
+                let verb = if on { "Pinned on top" } else { "Unpinned" };
+                self.push(
+                    Level::Info,
+                    format!("{verb}: {name} (PID {})", identity.pid),
+                );
+            }
+            Err(error) => {
+                let verb = if on { "pin" } else { "unpin" };
+                self.push(
+                    Level::Warn,
+                    format!("Cannot {verb} {name} (PID {}): {error}", identity.pid),
+                );
+            }
+        }
     }
 
     fn send(&mut self, alert: Alert) {
@@ -954,8 +1061,13 @@ impl Engine {
                 } else {
                     "window visible"
                 };
+                let pinned =
+                    (!client.windows.is_empty()).then(|| client.windows.iter().any(|w| w.topmost));
                 CardInfo {
                     index: index + 1,
+                    identity: client.identity,
+                    pinned,
+                    pip: self.pips.contains_key(&client.identity),
                     pid: client.identity.pid,
                     status,
                     color,
@@ -994,6 +1106,11 @@ impl Engine {
 
 struct CardInfo {
     index: usize,
+    identity: Identity,
+    /// Whether the game window is always on top; None = no window to pin
+    pinned: Option<bool>,
+    /// Picture-in-picture window open for this client
+    pip: bool,
     pid: u32,
     status: String,
     color: Color32,
@@ -1337,7 +1454,85 @@ fn card_frame() -> Frame {
         .inner_margin(Margin::same(14))
 }
 
-fn client_card(ui: &mut Ui, card: &CardInfo) {
+/// Square icon toggle for the client card, with the icon painted by hand because the font has
+/// no 📌 or PiP glyph. On = filled accent background, so the state shows without hovering
+fn icon_toggle(
+    ui: &mut Ui,
+    on: bool,
+    hover: &str,
+    icon: impl FnOnce(&egui::Painter, egui::Pos2, Color32),
+) -> bool {
+    let mut button = egui::Button::new("")
+        .min_size(egui::vec2(28.0, 22.0))
+        .corner_radius(CornerRadius::same(6));
+    if on {
+        button = button
+            .fill(tint(p().blue, 40))
+            .stroke(Stroke::new(1.0_f32, tint(p().blue, 120)));
+    }
+    let response = ui.add(button).on_hover_text(hover);
+    let color = if on || response.hovered() {
+        p().blue
+    } else {
+        p().muted
+    };
+    icon(ui.painter(), response.rect.center(), color);
+    response.clicked()
+}
+
+fn pin_button(ui: &mut Ui, pinned: bool) -> bool {
+    let hover = if pinned {
+        "Unpin: let other windows cover this game window again"
+    } else {
+        "Pin on top: keep this game window above other windows, so you can work in another app and still see the game"
+    };
+    icon_toggle(ui, pinned, hover, |painter, c, color| {
+        let bar = |left: f32, top: f32, right: f32, bottom: f32| {
+            egui::Rect::from_min_max(c + egui::vec2(left, top), c + egui::vec2(right, bottom))
+        };
+        // cap, neck, base plate, then the needle
+        painter.rect_filled(bar(-3.5, -7.0, 3.5, -5.0), CornerRadius::same(1), color);
+        painter.rect_filled(bar(-2.0, -5.0, 2.0, -1.0), CornerRadius::ZERO, color);
+        painter.rect_filled(bar(-5.0, -1.0, 5.0, 1.0), CornerRadius::same(1), color);
+        painter.line_segment(
+            [c + egui::vec2(0.0, 1.0), c + egui::vec2(0.0, 7.0)],
+            Stroke::new(1.4_f32, color),
+        );
+    })
+}
+
+fn pip_button(ui: &mut Ui, open: bool) -> bool {
+    let hover = if open {
+        "Close picture-in-picture"
+    } else {
+        "Picture-in-picture: a small live view of this game that floats above other windows. \
+         Drag to move, drag the edges to resize, double-click to go back to the game. \
+         Don't minimize the game (Windows stops drawing it); leave it behind your other apps."
+    };
+    icon_toggle(ui, open, hover, |painter, c, color| {
+        // screen outline with a small filled window in the bottom-right corner
+        painter.rect_stroke(
+            egui::Rect::from_center_size(c, egui::vec2(15.0, 11.0)),
+            CornerRadius::same(2),
+            Stroke::new(1.3_f32, color),
+            egui::StrokeKind::Middle,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_max(c + egui::vec2(0.5, 0.5), c + egui::vec2(5.5, 3.5)),
+            CornerRadius::same(1),
+            color,
+        );
+    })
+}
+
+/// What the user clicked on a client card
+enum CardAction {
+    Pin(bool),
+    Pip(bool),
+}
+
+fn client_card(ui: &mut Ui, card: &CardInfo) -> Option<CardAction> {
+    let mut action = None;
     let response = card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -1350,11 +1545,24 @@ fn client_card(ui: &mut Ui, card: &CardInfo) {
                 pill(ui, &card.status, card.color);
             });
         });
-        ui.label(
-            RichText::new(format!("PID {} · {}", card.pid, card.window))
-                .color(p().muted)
-                .small(),
-        );
+        ui.horizontal(|ui| {
+            let mut info = format!("PID {} · {}", card.pid, card.window);
+            if card.pinned == Some(true) {
+                info += " · pinned on top";
+            }
+            ui.label(RichText::new(info).color(p().muted).small());
+            if let Some(pinned) = card.pinned {
+                // right_to_left: the first button added ends up rightmost
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if pin_button(ui, pinned) {
+                        action = Some(CardAction::Pin(!pinned));
+                    }
+                    if pip_button(ui, card.pip) {
+                        action = Some(CardAction::Pip(!card.pip));
+                    }
+                });
+            }
+        });
         ui.add_space(2.0);
         match &card.server {
             Some(server) => {
@@ -1388,6 +1596,7 @@ fn client_card(ui: &mut Ui, card: &CardInfo) {
         },
         card.color,
     );
+    action
 }
 
 fn empty_state(ui: &mut Ui, title: &str, body: &str, color: Color32) {

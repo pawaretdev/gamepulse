@@ -19,7 +19,7 @@
 
 ## เริ่มใช้งาน
 
-1. โหลด `gamepulse-vX.Y.Z-windows-x64.zip` จากหน้า [Releases](https://github.com/pawaretdev/game-pulse/releases/latest) แล้วแตกไฟล์ไว้ในโฟลเดอร์ที่จะเก็บถาวร ไม่ต้องติดตั้ง
+1. โหลด `gamepulse-vX.Y.Z-windows-x64.zip` จากหน้า [Releases](https://github.com/pawaretdev/gamepulse/releases/latest) แล้วแตกไฟล์ไว้ในโฟลเดอร์ที่จะเก็บถาวร ไม่ต้องติดตั้ง
 2. เปิด **`gamepulse.exe`** ถ้า Windows ขึ้น "Windows protected your PC" (ไฟล์ไม่ได้ sign) ให้กด **More info** > **Run anyway**
 3. ทำตามหน้าตั้งค่า 4 ขั้น: เลือกช่องทางเตือน → ส่ง test เข้ามือถือ → ตั้งมือถือให้ปลุกติด → เลือกว่าจะเปิดพร้อม Windows ไหม
 4. ก่อนนอนกด **Settings > Test your setup > Run drill** สักครั้ง เพื่อพิสูจน์ว่ามัน "ปลุกติด" ไม่ใช่แค่ "ส่งถึง"

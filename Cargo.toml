@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Windows tray app that alerts your phone when a game client disconnects"
 license = "MIT"
-repository = "https://github.com/pawaretdev/game-pulse"
+repository = "https://github.com/pawaretdev/gamepulse"
 publish = false
 
 [[bin]]

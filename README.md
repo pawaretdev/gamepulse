@@ -19,7 +19,7 @@ A small Windows tray app that watches your game clients and alerts your phone th
 
 ## Getting started
 
-1. Download `gamepulse-vX.Y.Z-windows-x64.zip` from [Releases](https://github.com/pawaretdev/game-pulse/releases/latest) and unzip it into a folder you will keep. There is no installer.
+1. Download `gamepulse-vX.Y.Z-windows-x64.zip` from [Releases](https://github.com/pawaretdev/gamepulse/releases/latest) and unzip it into a folder you will keep. There is no installer.
 2. Run **`gamepulse.exe`**. If Windows shows "Windows protected your PC" (the file isn't code-signed), click **More info › Run anyway**.
 3. Follow the 4-step setup: pick an alert channel, send a test to your phone, make your phone wake you up, and choose whether to start with Windows.
 4. Before you sleep, run **Settings › Test your setup › Run drill** once. It proves the alerts wake you, not just that they arrive.

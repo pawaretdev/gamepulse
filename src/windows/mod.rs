@@ -1,5 +1,9 @@
+pub mod boss_watch;
 pub mod capture;
+pub mod ocr;
 pub mod pip;
+pub mod route;
+pub mod toast;
 
 use crate::{is_game_connection, Client, Connection, GameProfile, Identity, Snapshot, Window};
 use std::{
@@ -318,7 +322,7 @@ pub fn set_topmost(pid: u32, hwnds: &[usize], on: bool) -> Result<(), String> {
         }
         .map_err(|e| {
             if e.code() == ERROR_ACCESS_DENIED.to_hresult() {
-                "the game runs as administrator; run GamePulse as administrator too".to_string()
+                "the game runs as administrator; run Gamepulse as administrator too".to_string()
             } else {
                 e.to_string()
             }
@@ -335,6 +339,25 @@ pub fn set_topmost(pid: u32, hwnds: &[usize], on: bool) -> Result<(), String> {
         return Err("the game window has closed".into());
     }
     Ok(())
+}
+
+/// Visible top-level windows of one game's clients, newest client first (no TCP table read)
+pub fn game_windows(game: &'static GameProfile) -> Result<Vec<Window>, String> {
+    let mut clients = processes(std::slice::from_ref(game))?;
+    clients.sort_by_key(|(identity, _)| std::cmp::Reverse(identity.started_filetime));
+    let mut windows: BTreeMap<u32, Vec<Window>> =
+        clients.iter().map(|(c, _)| (c.pid, vec![])).collect();
+    if let Err(e) =
+        unsafe { EnumWindows(Some(enum_window), LPARAM(&mut windows as *mut _ as isize)) }
+    {
+        if e.code().is_err() {
+            return Err(format!("Window enumeration: {e}"));
+        }
+    }
+    Ok(clients
+        .iter()
+        .flat_map(|(c, _)| windows.remove(&c.pid).unwrap_or_default())
+        .collect())
 }
 
 /// Check every game in `games` at once: cost barely depends on the number of games, since processes and the TCP table are walked once

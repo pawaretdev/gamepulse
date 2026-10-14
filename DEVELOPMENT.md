@@ -1,6 +1,6 @@
-# GamePulse: development
+# Gamepulse: development
 
-The GamePulse app itself (formerly ROOC Monitor). End-user instructions are in the [README](README.md) ([Thai](README.th.md)); this file is for people building or changing the code.
+The Gamepulse app itself (formerly ROOC Monitor). End-user instructions are in the [README](README.md) ([Thai](README.th.md)); this file is for people building or changing the code.
 The old PowerShell/WPF version has been deleted (2026-09-30; see commit `a288aa8` for history). Outstanding verification work is listed at the end of this file.
 
 Two executables are built:
@@ -28,6 +28,18 @@ Games are pure data in `GAMES` (`src/lib.rs`): `id` (stored in config key `Watch
 
 Adding a game = adding a row to `GAMES`, but first confirm with the real game that "an Established TCP connection that is not loopback and not in `ignored_ports`"
 actually disappears when it disconnects (games that use UDP, connect directly on 443, or have a launcher/anti-cheat holding a connection need the rule extended first).
+
+## MVP tracker
+
+Ragnarok Origin Classic announces MVP deaths, 5-minute spawn warnings, spawns and 30% HP server-wide on the message bar at the bottom of the game window.
+The tracker reads that bar; it never touches the game process.
+
+- `boss.rs` (platform-neutral, unit-tested with real OCR lines): `ROOC_MVPS` (from the rooc-kit research data, `type: "MVP"`; Dark Priest is a Mini), `parse` (OCR text → `Sighting`), and `Tracker` (one-hour respawn timers → `Notice`s). Names are snapped to the list with an edit-distance match because the Thai parts of each message come out as noise. `GameProfile::mvps` attaches the list to a game; empty = no tracker.
+- `windows/boss_watch.rs`: a thread that every second picks the newest non-minimized client window, copies it with `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)` (works while covered, not minimized), crops the bottom bar (560/585 of the client height), skips it when it has no text or hasn't changed, and runs `windows/ocr.rs` (`Windows.Media.Ocr`, English recognizer) on a binarized 3× image, plus a green-only pass for death lines (the boss name is green, team names white). Dropping the `Watcher` stops the thread: "off" costs no CPU. An elevated game needs an elevated Gamepulse (PrintWindow fails with access denied otherwise).
+- `Engine::tick_bosses` feeds readings to the tracker, logs every reading to `gamepulse.log`, saves timers to `bosses.json` next to `config.json`, and sends alerts for ticked MVPs through `notify::send_boss`: Discord webhook and/or `windows/toast.rs` (WinRT toast under the AppUserModelID `Gamepulse`, registered in HKCU at startup). No burst, no repeat, no `@here`.
+- `windows/route.rs`: the floating MVP route window (GDI-painted, own thread and message loop like `pip`). The Engine refreshes its shared `RouteView` every tick; the window repaints every second, so it keeps working while the main window is hidden.
+- MVP pictures are user-supplied like covers: `mvps/<kebab-case name>.png` next to `config.json`, loaded once at startup (`hub::load_mvp_art`); the folder is gitignored. Status colors: green up, amber up at 30% HP, blue spawning within the warning time, red dead, grey unknown.
+- `gamepulse-cli --mvp-probe SECONDS` prints each reading and how it parses, for checking OCR against the live game.
 
 ## Done
 
@@ -156,6 +168,7 @@ But phase 1 acceptance in the table above is not done: the API/session timestamp
 and capture has not been checked with multiple monitors / mixed DPI / lock screen / sleep-resume.
 There are no fake-clock regression tests for the state machine yet (phase 2); for now it is verified by real use on the game machine.
 "Pin on top" (`windows::set_topmost`) has not been tried on `rooc.exe` yet. Still to check: that the game doesn't reset its own z-order, the elevated-game error, and behaviour after a resolution change that recreates the window.
+The MVP tracker was tried against the live game on 2026-10-14 (window 1094×585, covered by other windows, game and Gamepulse elevated): deaths, 5-minute warnings, spawns and 30% HP were read and the one-hour rule held to within seconds. Still to check: other window sizes (the bar position is scaled from 1094×585), fullscreen, and the Windows notification from an elevated process.
 Picture-in-picture (`windows::pip`, DWM thumbnail) has not been tried on `rooc.exe` either. Still to check: that the game keeps rendering while covered and unfocused, mixed-DPI monitors, and dragging a `WS_EX_NOACTIVATE` window.
 
 API sources: [GetExtendedTcpTable](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getextendedtcptable),

@@ -151,9 +151,9 @@ pub(super) fn ios_tips(ui: &mut Ui) {
 
 fn step_welcome(ui: &mut Ui) {
     let names: Vec<_> = GAMES.iter().map(|g| g.name).collect();
-    ui.label(RichText::new("Welcome to GamePulse").size(20.0).semibold());
+    ui.label(RichText::new("Welcome to Gamepulse").size(20.0).semibold());
     ui.label(
-        "GamePulse watches your game clients and alerts your phone when one disconnects, \
+        "Gamepulse watches your game clients and alerts your phone when one disconnects, \
          so you can sleep while your characters stay logged in.",
     );
     hint(ui, &format!("Supported: {}.", names.join(", ")), p().muted);
@@ -357,7 +357,7 @@ fn step_done(ui: &mut Ui, ob: &mut Onboarding) {
     ui.label(RichText::new("You're all set").size(20.0).semibold());
     ui.checkbox(
         &mut ob.launch_at_login,
-        "Open GamePulse when I sign in to Windows",
+        "Open Gamepulse when I sign in to Windows",
     );
     ui.checkbox(&mut ob.draft.auto_start, "Start watching automatically");
     ui.add_space(6.0);

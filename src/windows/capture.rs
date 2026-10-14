@@ -18,7 +18,7 @@ use windows::Win32::{
     },
 };
 
-struct ScreenDc(HDC);
+pub(super) struct ScreenDc(pub(super) HDC);
 impl Drop for ScreenDc {
     fn drop(&mut self) {
         unsafe {
@@ -27,7 +27,7 @@ impl Drop for ScreenDc {
     }
 }
 
-struct MemoryDc(HDC);
+pub(super) struct MemoryDc(pub(super) HDC);
 impl Drop for MemoryDc {
     fn drop(&mut self) {
         unsafe {
@@ -36,7 +36,7 @@ impl Drop for MemoryDc {
     }
 }
 
-struct Bitmap(HBITMAP);
+pub(super) struct Bitmap(pub(super) HBITMAP);
 impl Drop for Bitmap {
     fn drop(&mut self) {
         unsafe {
@@ -45,9 +45,9 @@ impl Drop for Bitmap {
     }
 }
 
-struct SelectedBitmap<'a> {
-    dc: &'a HDC,
-    previous: HGDIOBJ,
+pub(super) struct SelectedBitmap<'a> {
+    pub(super) dc: &'a HDC,
+    pub(super) previous: HGDIOBJ,
 }
 impl Drop for SelectedBitmap<'_> {
     fn drop(&mut self) {
@@ -68,7 +68,7 @@ struct DesktopCapture {
     preview_file: Option<String>,
 }
 
-fn last_error(action: &str) -> String {
+pub(super) fn last_error(action: &str) -> String {
     format!("{action}: {}", windows::core::Error::from_win32())
 }
 

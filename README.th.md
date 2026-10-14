@@ -1,6 +1,6 @@
-<p align="center"><img src="assets/icon-256.png" width="128" alt="GamePulse icon"></p>
+<p align="center"><img src="assets/icon-256.png" width="128" alt="Gamepulse icon"></p>
 
-<h1 align="center">GamePulse</h1>
+<h1 align="center">Gamepulse</h1>
 
 <p align="center"><a href="README.md">English</a> · <b>ภาษาไทย</b></p>
 
@@ -11,9 +11,10 @@
 - ไม่อ่าน memory เกม ไม่คลิกอะไรแทน และไม่แตะ account
 - ปิดหน้าต่างแล้วยังเฝ้าต่อใน system tray
 - ตรึงหน้าต่างเกมไว้บนสุด หรือย่อเป็นจอเล็กลอยแบบภาพซ้อนภาพ ทำงานไปดูเกมไปได้
+- **MVP tracker** (เปิดเองได้): อ่านประกาศ MVP ของเกมจากหน้าต่างเกม แล้วเตือนทาง Discord หรือ Windows notification ก่อน MVP แต่ละตัวเกิด
 
 <p align="center">
-  <img src="docs/library.png" width="49%" alt="หน้า library ของ GamePulse เปิดเตือนไว้และ client ออนไลน์ทั้งคู่">
+  <img src="docs/library.png" width="49%" alt="หน้า library ของ Gamepulse เปิดเตือนไว้และ client ออนไลน์ทั้งคู่">
   <img src="docs/game.png" width="49%" alt="หน้าเกมแสดงการเชื่อมต่อและเวลา session ของแต่ละ client">
 </p>
 
@@ -29,9 +30,9 @@
 
 ## เอกสาร
 
-- [คู่มือการใช้งาน](docs/guide.th.md): หน้าจอหลัก, Settings, ปกเกม, อัปเดต, ถอนการติดตั้ง, command line
+- [คู่มือการใช้งาน](docs/guide.th.md): หน้าจอหลัก, Settings, MVP tracker, ปกเกม, อัปเดต, ถอนการติดตั้ง, command line
 - [ตั้งมือถือให้ปลุกติด](docs/phone-setup.th.md): Android และ iPhone
-- [GamePulse ทำงานยังไง](docs/how-it-works.th.md): ตรวจการหลุดยังไง, เตือนเมื่อไหร่, ข้อจำกัด
+- [Gamepulse ทำงานยังไง](docs/how-it-works.th.md): ตรวจการหลุดยังไง, เตือนเมื่อไหร่, ข้อจำกัด
 - [DEVELOPMENT.md](DEVELOPMENT.md): build จาก source และออก release (ภาษาอังกฤษ)
 
 ## License

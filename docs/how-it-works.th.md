@@ -1,4 +1,4 @@
-# GamePulse ทำงานยังไง
+# Gamepulse ทำงานยังไง
 
 [English](how-it-works.md) · **ภาษาไทย** · [กลับไปที่ README](../README.th.md)
 

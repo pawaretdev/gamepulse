@@ -39,10 +39,10 @@ BEGIN
     BLOCK "040904B0"
     BEGIN
       VALUE "CompanyName", "pawaretdev"
-      VALUE "FileDescription", "GamePulse"
+      VALUE "FileDescription", "Gamepulse"
       VALUE "FileVersion", "{version}"
       VALUE "LegalCopyright", "Copyright (c) 2026 pawaretdev. MIT License."
-      VALUE "ProductName", "GamePulse"
+      VALUE "ProductName", "Gamepulse"
       VALUE "ProductVersion", "{version}"
     END
   END

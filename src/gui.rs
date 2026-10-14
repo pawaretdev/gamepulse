@@ -5,7 +5,9 @@
 //! so eframe never calls `update()` — logic living there would stop all monitoring while hidden.
 //! For the same reason the tray menu is handled in the tray's own event handler, calling Win32 directly.
 use crate::{
+    boss,
     notify::{self, Alert, Kind},
+    windows::boss_watch,
     Config, GameProfile, Identity, Snapshot, GAMES,
 };
 use eframe::egui::{
@@ -84,7 +86,9 @@ fn theme_index(name: &str) -> usize {
 const MAX_EVENTS: usize = 300;
 /// FILETIME of 1970-01-01 (100 ns intervals since 1601)
 const UNIX_EPOCH_FILETIME: i64 = 116_444_736_000_000_000;
-const SHOW_EVENT_NAME: windows::core::PCWSTR = w!("Local\\GamePulseShow");
+const SHOW_EVENT_NAME: windows::core::PCWSTR = w!("Local\\GamepulseShow");
+/// MVP timers, next to config.json, so a restart keeps counting down
+const BOSSES_FILE: &str = "bosses.json";
 
 fn root_path(name: &str) -> PathBuf {
     if let Ok(executable) = std::env::current_exe() {
@@ -126,6 +130,30 @@ fn local_stamp() -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Local "HH:MM" of a unix time, using the current offset between local time and UTC
+fn clock(unix: u64) -> String {
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    let (local, utc) = unsafe { (GetLocalTime(), GetSystemTime()) };
+    let minutes =
+        |t: windows::Win32::Foundation::SYSTEMTIME| i64::from(t.wHour) * 60 + i64::from(t.wMinute);
+    // Local and UTC may be on different days (or months: 1st vs 31st)
+    let days = match i32::from(local.wDay) - i32::from(utc.wDay) {
+        0 => 0,
+        1 | i32::MIN..=-2 => 1,
+        _ => -1,
+    };
+    let offset = minutes(local) - minutes(utc) + days * 24 * 60;
+    let day_minute = (unix as i64 / 60 + offset).rem_euclid(24 * 60);
+    format!("{:02}:{:02}", day_minute / 60, day_minute % 60)
 }
 
 fn now_filetime() -> i64 {
@@ -233,6 +261,16 @@ struct Engine {
     internet_alert: AlertState,
     drill: Option<Drill>,
     next_seq: u64,
+    /// MVP tracker: the game it runs for (first in `GAMES` with an MVP list), its timers,
+    /// and the capture/OCR thread while it is on
+    boss_game: Option<&'static GameProfile>,
+    bosses: boss::Tracker,
+    boss_watch: Option<boss_watch::Watcher>,
+    /// None = reading the game window; Some = why not (or "Starting...")
+    boss_problem: Option<String>,
+    boss_channel_warned: bool,
+    /// Open MVP route window (HWND as usize) and what it shows
+    route: Option<(usize, crate::windows::route::Shared)>,
 }
 
 /// Disconnect drill: fires the same burst as a real drop DRILL_ROUNDS times, RepeatAlertMin apart.
@@ -271,8 +309,24 @@ impl Engine {
             internet_alert: AlertState::default(),
             drill: None,
             next_seq: 0,
+            boss_game: GAMES.iter().find(|g| !g.mvps.is_empty()),
+            bosses: boss::Tracker::new(&[], Default::default()),
+            boss_watch: None,
+            boss_problem: None,
+            boss_channel_warned: false,
+            route: None,
         };
         engine.push(Level::Info, "Application started".into());
+        if let Some(game) = engine.boss_game {
+            let timers = fs::read_to_string(root_path(BOSSES_FILE))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            engine.bosses = boss::Tracker::new(game.mvps, timers);
+            if engine.config.boss_tracker {
+                engine.start_boss_watch();
+            }
+        }
         if engine.config.auto_start && !engine.watching {
             engine.push(
                 Level::Warn,
@@ -385,6 +439,8 @@ impl Engine {
 
     fn tick(&mut self) {
         self.step_drill();
+        self.tick_bosses();
+        self.update_route();
         for index in (0..self.jobs.len()).rev() {
             if let Ok(results) = self.jobs[index].try_recv() {
                 for result in results {
@@ -561,6 +617,396 @@ impl Engine {
         }
     }
 
+    // ------------------------------------------------ MVP tracker
+
+    fn start_boss_watch(&mut self) {
+        if let Some(game) = self.boss_game {
+            self.boss_watch = Some(boss_watch::start(game));
+            self.boss_problem = Some("Starting...".into());
+        }
+    }
+
+    /// Turn the MVP tracker on/off (saved). Off drops the capture thread, so it costs no CPU
+    fn set_boss_tracker(&mut self, on: bool) {
+        self.config.boss_tracker = on;
+        if let Err(error) = save_config(&self.config) {
+            self.push(Level::Warn, format!("Cannot save settings: {error}"));
+        }
+        if on {
+            self.start_boss_watch();
+            self.push(Level::Good, "MVP tracker on".into());
+            if notify::boss_channels(&self.config).is_empty() {
+                self.push(
+                    Level::Warn,
+                    "MVP alerts have nowhere to go: turn on Discord or Windows notifications in Settings › MVP tracker".into(),
+                );
+            }
+        } else {
+            self.boss_watch = None;
+            self.boss_problem = None;
+            self.push(Level::Info, "MVP tracker off".into());
+        }
+    }
+
+    fn set_boss_tracked(&mut self, name: &str, on: bool) {
+        self.config.set_boss_tracked(name, on);
+        if let Err(error) = save_config(&self.config) {
+            self.push(Level::Warn, format!("Cannot save settings: {error}"));
+        }
+    }
+
+    /// Forget every MVP timer (e.g. after Gamepulse was closed for a while): all back to "not seen"
+    fn clear_boss_timers(&mut self) {
+        self.bosses.timers.clear();
+        self.save_bosses();
+        self.push(
+            Level::Info,
+            "MVP timers cleared: every MVP is back to not seen yet".into(),
+        );
+    }
+
+    fn set_all_bosses_tracked(&mut self, on: bool) {
+        self.config.tracked_bosses = if on {
+            self.bosses
+                .mvps()
+                .iter()
+                .map(|m| m.name.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Err(error) = save_config(&self.config) {
+            self.push(Level::Warn, format!("Cannot save settings: {error}"));
+        }
+    }
+
+    fn save_bosses(&mut self) {
+        let result = serde_json::to_vec_pretty(&self.bosses.timers)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| fs::write(root_path(BOSSES_FILE), bytes).map_err(|e| e.to_string()));
+        if let Err(error) = result {
+            self.push(Level::Warn, format!("Cannot save MVP timers: {error}"));
+        }
+    }
+
+    /// Readings from the capture thread → timers → notices; also the time-based notices
+    fn tick_bosses(&mut self) {
+        let (Some(game), Some(watch)) = (self.boss_game, &self.boss_watch) else {
+            return;
+        };
+        let readings: Vec<_> = watch.readings.try_iter().collect();
+        let now = unix_now();
+        let lead = self.config.boss_lead_min * 60;
+        let before = self.bosses.timers.clone();
+        let mut notices = Vec::new();
+        for reading in readings {
+            match reading {
+                boss_watch::Reading::Problem(problem) => {
+                    if problem != self.boss_problem {
+                        match &problem {
+                            None => self
+                                .push(Level::Good, "MVP tracker: reading the game window".into()),
+                            Some(problem) => self.push(
+                                Level::Warn,
+                                format!("MVP tracker cannot read the game: {problem}"),
+                            ),
+                        }
+                    }
+                    self.boss_problem = problem;
+                }
+                boss_watch::Reading::Text { full, green } => {
+                    // Every reading goes to the log file only, for checking OCR later
+                    Self::write_log(&local_stamp(), &format!("MVP bar: {full} | green: {green}"));
+                    if let Some((mvp, sighting)) = boss::parse(game.mvps, &full, &green) {
+                        notices.extend(self.bosses.observe(mvp, sighting, now, lead));
+                    }
+                }
+            }
+        }
+        notices.extend(self.bosses.tick(now, lead));
+        for notice in notices {
+            self.boss_notice(game, notice, now);
+        }
+        if self.bosses.timers != before {
+            self.save_bosses();
+        }
+    }
+
+    /// Log every notice; alert only for tracked MVPs and the alert kinds turned on in Settings
+    fn boss_notice(&mut self, game: &'static GameProfile, notice: boss::Notice, now: u64) {
+        let map_of = |name: &str| {
+            game.mvps
+                .iter()
+                .find(|m| m.name == name)
+                .map_or("", |m| m.map)
+        };
+        let config = &self.config;
+        let (name, wanted, title, message, kind) = match notice {
+            boss::Notice::Died { mvp, spawn_at } => (
+                mvp,
+                config.boss_alert_death,
+                format!("{mvp} died"),
+                format!("Respawns around {} · {}", clock(spawn_at), map_of(mvp)),
+                Kind::Info,
+            ),
+            boss::Notice::Soon { mvp, spawn_at } => (
+                mvp,
+                config.boss_lead_min > 0,
+                format!(
+                    "{mvp} spawns in {} min",
+                    spawn_at.saturating_sub(now).div_ceil(60)
+                ),
+                format!("{} · around {}", map_of(mvp), clock(spawn_at)),
+                Kind::Warn,
+            ),
+            boss::Notice::Spawned { mvp, announced } => (
+                mvp,
+                config.boss_alert_spawn,
+                if announced {
+                    format!("{mvp} has spawned")
+                } else {
+                    format!("{mvp} should be up now")
+                },
+                if announced {
+                    map_of(mvp).to_string()
+                } else {
+                    format!(
+                        "{} · predicted; the game's announcement was not seen",
+                        map_of(mvp)
+                    )
+                },
+                Kind::Up,
+            ),
+            boss::Notice::LowHp { mvp } => (
+                mvp,
+                config.boss_alert_low_hp,
+                format!("{mvp} is at 30% HP"),
+                map_of(mvp).to_string(),
+                Kind::Warn,
+            ),
+        };
+        self.push(Level::of_kind(kind), format!("MVP: {title} · {message}"));
+        if wanted && self.config.tracks_boss(name) {
+            let alert = Alert {
+                title: titled(game, &title),
+                message,
+                kind,
+                urgent: false,
+                fields: vec![],
+                desktop_bmp: None,
+            };
+            self.send_boss_alert(self.config.clone(), alert);
+        }
+    }
+
+    fn send_boss_alert(&mut self, config: Config, alert: Alert) {
+        if notify::boss_channels(&config).is_empty() {
+            if !self.boss_channel_warned {
+                self.boss_channel_warned = true;
+                self.push(
+                    Level::Warn,
+                    "MVP alert not sent: turn on Discord or Windows notifications in Settings › MVP tracker".into(),
+                );
+            }
+            return;
+        }
+        self.spawn_job(move || notify::send_boss(config, alert));
+    }
+
+    /// Settings button: uses the unsaved draft, like the other test buttons
+    fn test_boss_alert(&mut self, config: Config) {
+        let channels = notify::boss_channels(&config);
+        if !channels.is_empty() {
+            self.push(
+                Level::Info,
+                format!("Sending a test MVP alert via {}", channels.join(", ")),
+            );
+        }
+        let game = self.boss_game.unwrap_or(&GAMES[0]);
+        self.boss_channel_warned = false;
+        self.send_boss_alert(
+            config,
+            Alert {
+                title: titled(game, "Test MVP alert"),
+                message: "MVP spawn alerts will look like this.".into(),
+                kind: Kind::Info,
+                urgent: false,
+                fields: vec![],
+                desktop_bmp: None,
+            },
+        );
+    }
+
+    /// Header pill of the MVP tracker
+    fn boss_status(&self) -> (String, Color32) {
+        match (&self.boss_watch, &self.boss_problem) {
+            (None, _) => ("OFF".into(), p().grey),
+            (Some(_), None) => ("READING".into(), p().green),
+            (Some(_), Some(problem)) if problem == "Starting..." => ("STARTING".into(), p().blue),
+            (Some(_), Some(_)) => ("CAN'T READ".into(), p().amber),
+        }
+    }
+
+    /// Status text and color of one MVP. Colors: green = up, amber = up at 30% HP,
+    /// blue = spawns within the warning time, red = dead (counting down), grey = unknown
+    fn boss_state(&self, mvp: &boss::Mvp, now: u64) -> (String, Color32) {
+        let soon = (self.config.boss_lead_min * 60).max(boss::WARNING_SECS);
+        match self.bosses.status(mvp) {
+            boss::Status::Waiting { spawn_at } if spawn_at > now => (
+                format!(
+                    "Spawns {} · in {}",
+                    clock(spawn_at),
+                    format_duration(spawn_at - now)
+                ),
+                if spawn_at - now <= soon {
+                    p().blue
+                } else {
+                    p().red
+                },
+            ),
+            // Only while the tracker is off: the predicted time passed without a reading
+            boss::Status::Waiting { spawn_at } => {
+                (format!("Due since {}", clock(spawn_at)), p().green)
+            }
+            boss::Status::Up {
+                since,
+                low_hp: true,
+            } => (format!("30% HP · up since {}", clock(since)), p().amber),
+            boss::Status::Up { since, .. } => (format!("Up since {}", clock(since)), p().green),
+            boss::Status::Unknown => ("Not seen yet".into(), p().muted),
+        }
+    }
+
+    /// One row per MVP, in the game's list order
+    fn boss_rows(&self) -> Vec<BossRow> {
+        let now = unix_now();
+        self.bosses
+            .mvps()
+            .iter()
+            .map(|mvp| {
+                let (status, color) = self.boss_state(mvp, now);
+                BossRow {
+                    name: mvp.name,
+                    map: mvp.map,
+                    tracked: self.config.tracks_boss(mvp.name),
+                    status,
+                    color,
+                }
+            })
+            .collect()
+    }
+
+    /// Where to go next: MVPs that are up (longest up first), then the rest by spawn time.
+    /// MVPs never seen since the tracker started are left out
+    fn route_lines(&self) -> Vec<crate::windows::route::RouteLine> {
+        let now = unix_now();
+        let mut lines: Vec<((u8, u64), crate::windows::route::RouteLine)> = self
+            .bosses
+            .mvps()
+            .iter()
+            .filter(|mvp| self.config.boss_route_all || self.config.tracks_boss(mvp.name))
+            .filter_map(|mvp| {
+                let (order, when) = match self.bosses.status(mvp) {
+                    boss::Status::Unknown => return None,
+                    boss::Status::Up { since, low_hp } => (
+                        (0, since),
+                        if low_hp {
+                            "30% HP".to_string()
+                        } else {
+                            format!("UP · {}", format_duration(now.saturating_sub(since)))
+                        },
+                    ),
+                    boss::Status::Waiting { spawn_at } if spawn_at <= now => {
+                        ((0, spawn_at), "due".to_string())
+                    }
+                    boss::Status::Waiting { spawn_at } => (
+                        (1, spawn_at),
+                        format!(
+                            "{} · in {}",
+                            clock(spawn_at),
+                            format_duration(spawn_at - now)
+                        ),
+                    ),
+                };
+                let (_, color) = self.boss_state(mvp, now);
+                Some((
+                    order,
+                    crate::windows::route::RouteLine {
+                        name: mvp.name.to_string(),
+                        map: mvp.map.to_string(),
+                        when,
+                        color: hex(color),
+                    },
+                ))
+            })
+            .collect();
+        lines.sort_by_key(|(order, _)| *order);
+        lines.into_iter().map(|(_, line)| line).collect()
+    }
+
+    fn route_open(&self) -> bool {
+        self.route.is_some()
+    }
+
+    /// Open or close the floating MVP route window
+    fn toggle_route(&mut self) {
+        if let Some((hwnd, _)) = self.route.take() {
+            crate::windows::route::close(hwnd);
+            return;
+        }
+        let shared = Arc::new(Mutex::new(crate::windows::route::RouteView {
+            show_all: self.config.boss_route_all,
+            ..Default::default()
+        }));
+        self.route = Some((0, shared.clone()));
+        self.update_route();
+        match crate::windows::route::open(shared.clone()) {
+            Ok(hwnd) => self.route = Some((hwnd, shared)),
+            Err(error) => {
+                self.route = None;
+                self.push(
+                    Level::Warn,
+                    format!("Cannot open the MVP route window: {error}"),
+                );
+            }
+        }
+    }
+
+    /// Keep the route window's lines current; save its "all / ticked" choice
+    fn update_route(&mut self) {
+        let Some((hwnd, shared)) = self.route.clone() else {
+            return;
+        };
+        if hwnd != 0 && !crate::windows::route::is_open(hwnd) {
+            self.route = None;
+            return;
+        }
+        let show_all = shared
+            .lock()
+            .map_or(self.config.boss_route_all, |v| v.show_all);
+        if show_all != self.config.boss_route_all {
+            self.config.boss_route_all = show_all;
+            if let Err(error) = save_config(&self.config) {
+                self.push(Level::Warn, format!("Cannot save settings: {error}"));
+            }
+        }
+        let lines = self.route_lines();
+        let empty = if self.config.boss_route_all {
+            "No MVP seen yet. Keep the MVP tracker on."
+        } else {
+            "No ticked MVP seen yet. Keep the MVP tracker on."
+        };
+        if let Ok(mut view) = shared.lock() {
+            view.lines = lines;
+            view.empty = empty.into();
+            view.colors = crate::windows::route::RouteColors {
+                background: hex(p().panel),
+                border: hex(p().border),
+                text: hex(p().text),
+                muted: hex(p().muted),
+            };
+        };
+    }
     fn send(&mut self, alert: Alert) {
         let config = self.config.clone();
         self.send_with(config, alert, None);
@@ -1104,6 +1550,19 @@ impl Engine {
     }
 }
 
+struct BossRow {
+    name: &'static str,
+    map: &'static str,
+    tracked: bool,
+    status: String,
+    color: Color32,
+}
+
+/// 0xRRGGBB for the Win32 route window
+fn hex(color: Color32) -> u32 {
+    (u32::from(color.r()) << 16) | (u32::from(color.g()) << 8) | u32::from(color.b())
+}
+
 struct CardInfo {
     index: usize,
     identity: Identity,
@@ -1207,7 +1666,7 @@ fn tray_icon() -> Option<Icon> {
 
 fn install_tray(engine: Arc<Mutex<Engine>>, hwnd: Hwnd, context: egui::Context) {
     let menu = Menu::new();
-    let show = MenuItem::new("Show GamePulse", true, None);
+    let show = MenuItem::new("Show Gamepulse", true, None);
     let exit = MenuItem::new("Exit", true, None);
     let _ = menu.append_items(&[&show, &exit]);
     let (show_id, exit_id) = (show.id().clone(), exit.id().clone());
@@ -1216,7 +1675,7 @@ fn install_tray(engine: Arc<Mutex<Engine>>, hwnd: Hwnd, context: egui::Context) 
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
-            .with_tooltip("GamePulse")
+            .with_tooltip("Gamepulse")
             .with_icon(icon)
             .build()
             .ok()
@@ -1652,8 +2111,8 @@ fn wide_field(ui: &mut Ui, label: &str, value: &mut String, secret: bool, placeh
 // Replaces the old PowerShell version's Task Scheduler + Start-Watch.cmd: uses HKCU Run, no admin rights needed
 
 const RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: windows::core::PCWSTR = w!("GamePulse");
-/// Name before the rename to GamePulse; points at rooc-monitor.exe, which no longer exists
+const RUN_VALUE: windows::core::PCWSTR = w!("Gamepulse");
+/// Name before the rename to Gamepulse; points at rooc-monitor.exe, which no longer exists
 const LEGACY_RUN_VALUE: windows::core::PCWSTR = w!("ROOC Monitor");
 
 fn launch_at_login() -> bool {
@@ -1730,7 +2189,7 @@ fn migrate_legacy_launch(engine: &mut Engine) {
     match result {
         Ok(()) => engine.push(
             Level::Info,
-            "Moved the old ROOC Monitor sign-in launch to GamePulse".into(),
+            "Moved the old ROOC Monitor sign-in launch to Gamepulse".into(),
         ),
         Err(error) => engine.push(
             Level::Warn,
@@ -1800,6 +2259,54 @@ fn tools_section(ui: &mut Ui, draft: &Config, engine: &mut Engine) {
                 engine.capture();
             }
         });
+    });
+}
+
+/// Which MVP alerts to send and where; turning the tracker on/off and choosing MVPs is on the game page
+fn boss_settings(ui: &mut Ui, draft: &mut Config, engine: &mut Engine) {
+    section(ui, "MVP tracker", |ui| {
+        egui::Grid::new("mvp")
+            .num_columns(2)
+            .spacing([16.0, 10.0])
+            .show(ui, |ui| {
+                row(ui, "Warn before a spawn", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut draft.boss_lead_min)
+                            .range(0..=55)
+                            .suffix(" min"),
+                    );
+                });
+            });
+        if draft.boss_lead_min == 0 {
+            hint(ui, "No warning before a spawn.", p().muted);
+        }
+        ui.checkbox(&mut draft.boss_alert_spawn, "Alert when an MVP spawns");
+        ui.checkbox(&mut draft.boss_alert_death, "Alert when an MVP dies");
+        ui.checkbox(
+            &mut draft.boss_alert_low_hp,
+            "Alert when an MVP drops to 30% HP",
+        );
+        ui.add_space(4.0);
+        ui.label(RichText::new("Send MVP alerts to").color(p().muted));
+        ui.checkbox(&mut draft.boss_discord, "Discord webhook");
+        if draft.boss_discord && draft.webhook_url.trim().is_empty() {
+            hint(ui, "Needs the Discord webhook above.", p().amber);
+        }
+        ui.checkbox(&mut draft.boss_toast, "Windows notification");
+        if ui
+            .button("🔔  Test MVP alert")
+            .on_hover_text("Sends one MVP-style alert to the places ticked above")
+            .clicked()
+        {
+            engine.test_boss_alert(draft.clone());
+        }
+        hint(
+            ui,
+            "Turn the tracker on and pick MVPs on the game's page. It reads the game's \
+             announcements from the game window once a second: keep the game open (covered is \
+             fine, minimized is not). If the game runs as administrator, Gamepulse must too.",
+            p().muted,
+        );
     });
 }
 
@@ -1988,10 +2495,13 @@ fn settings_form(ui: &mut Ui, draft: &mut SettingsDraft, engine: &mut Engine) {
             hint(ui, "Heartbeat is off.", p().muted);
         }
     });
+    if engine.boss_game.is_some() {
+        boss_settings(ui, &mut draft.config, engine);
+    }
     section(ui, "App", |ui| {
         ui.checkbox(
             &mut draft.launch_at_login,
-            "Open GamePulse when I sign in to Windows",
+            "Open Gamepulse when I sign in to Windows",
         );
         ui.checkbox(
             &mut draft.config.auto_start,
@@ -2021,6 +2531,7 @@ struct App {
     open_game: Option<&'static GameProfile>,
     filter: hub::Filter,
     covers: hub::Covers,
+    mvp_art: hub::MvpArt,
     /// Cover picker dialog currently open (runs on a separate thread), one at a time
     cover_job: Option<hub::CoverJob>,
 }
@@ -2035,6 +2546,12 @@ fn open_settings(engine: &Engine) -> SettingsDraft {
 impl App {
     fn new(creation: &eframe::CreationContext<'_>) -> Self {
         let engine = Arc::new(Mutex::new(Engine::new()));
+        if let Err(error) = crate::windows::toast::register() {
+            lock(&engine).push(
+                Level::Warn,
+                format!("Windows notifications may not show: {error}"),
+            );
+        }
         CURRENT_THEME.store(theme_index(&lock(&engine).config.theme), Ordering::Relaxed);
         install_fonts(&creation.egui_ctx);
         apply_theme(&creation.egui_ctx);
@@ -2053,6 +2570,7 @@ impl App {
         listen_for_second_instance(hwnd, creation.egui_ctx.clone());
         // First run: with no alert channel yet, show onboarding; existing users who already set one up skip it silently
         let covers = hub::load_covers(&creation.egui_ctx, &mut lock(&engine));
+        let mvp_art = hub::load_mvp_art(&creation.egui_ctx, &mut lock(&engine));
         let onboarding = {
             let mut engine = lock(&engine);
             migrate_legacy_launch(&mut engine);
@@ -2073,6 +2591,7 @@ impl App {
             open_game: None,
             filter: hub::Filter::All,
             covers,
+            mvp_art,
             cover_job: None,
         }
     }
@@ -2127,7 +2646,7 @@ impl eframe::App for App {
             )
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("GamePulse").size(20.0).semibold());
+                    ui.label(RichText::new("Gamepulse").size(20.0).semibold());
                     ui.add_space(6.0);
                     let (status, color) = engine.overall();
                     pill(ui, &status, color);
@@ -2252,7 +2771,13 @@ impl eframe::App for App {
             .frame(Frame::new().fill(p().bg).inner_margin(Margin::same(16)))
             .show(context, |ui| match self.open_game {
                 None => hub::library(ui, &mut engine, &self.covers, &mut self.filter),
-                Some(game) => hub::game_page(ui, &mut engine, game, self.covers.get(game.id)),
+                Some(game) => hub::game_page(
+                    ui,
+                    &mut engine,
+                    game,
+                    self.covers.get(game.id),
+                    &self.mvp_art,
+                ),
             })
             .inner;
         match action {
@@ -2306,9 +2831,9 @@ impl eframe::App for App {
                                 Ok(()) => engine.push(
                                     Level::Good,
                                     if draft.launch_at_login {
-                                        "GamePulse will open when you sign in to Windows"
+                                        "Gamepulse will open when you sign in to Windows"
                                     } else {
-                                        "GamePulse will no longer open at sign-in"
+                                        "Gamepulse will no longer open at sign-in"
                                     }
                                     .into(),
                                 ),
@@ -2345,7 +2870,7 @@ impl eframe::App for App {
 
 pub fn run() -> Result<(), String> {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("GamePulse")
+        .with_title("Gamepulse")
         .with_inner_size([900.0, 780.0])
         .with_min_inner_size([560.0, 460.0]);
     if let Some(rgba) = icon_rgba(64) {
@@ -2360,7 +2885,7 @@ pub fn run() -> Result<(), String> {
         ..Default::default()
     };
     eframe::run_native(
-        "GamePulse",
+        "Gamepulse",
         options,
         Box::new(|creation| Ok(Box::new(App::new(creation)))),
     )

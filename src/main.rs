@@ -10,7 +10,7 @@ fn show_error(text: &str) {
         MessageBoxW(
             None,
             &HSTRING::from(text),
-            &HSTRING::from("GamePulse"),
+            &HSTRING::from("Gamepulse"),
             MB_OK | MB_ICONERROR,
         );
     }
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
             show_error("gamepulse.exe only opens the GUI.\nUse gamepulse-cli.exe for --once, --capture or --capture-preview.");
             return ExitCode::from(3);
         }
-        let instance = unsafe { CreateMutexW(None, false, w!("Local\\GamePulse")) };
+        let instance = unsafe { CreateMutexW(None, false, w!("Local\\Gamepulse")) };
         if instance.is_ok() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             // The running instance may be hidden in the tray: wake it to show its window instead of silently exiting
             gamepulse::gui::show_existing_instance();

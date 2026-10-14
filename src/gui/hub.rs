@@ -652,26 +652,289 @@ fn game_header(
     action
 }
 
+/// MVP pictures, user-supplied like covers: `mvps/<name>.png` next to config.json
+/// (e.g. `mvps/golden-thief-bug.png`). Game art is never bundled; no file = a letter placeholder
+pub(super) type MvpArt = HashMap<&'static str, egui::TextureHandle>;
+
+const MVP_ART_DIR: &str = "mvps";
+const MVP_ICON: f32 = 30.0;
+
+fn mvp_file_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace(' ', "-")
+}
+
+pub(super) fn load_mvp_art(context: &egui::Context, engine: &mut Engine) -> MvpArt {
+    let mut art = HashMap::new();
+    for mvp in GAMES.iter().flat_map(|g| g.mvps) {
+        let path = root_path(MVP_ART_DIR).join(format!("{}.png", mvp_file_name(mvp.name)));
+        if !path.is_file() {
+            continue;
+        }
+        match image::open(&path) {
+            Ok(image) => {
+                let small = image.thumbnail(96, 96).to_rgba8();
+                art.insert(
+                    mvp.name,
+                    texture(context, format!("mvp-{}", mvp.name), &small),
+                );
+            }
+            Err(error) => engine.push(
+                Level::Warn,
+                format!("Cannot load MVP picture {}: {error}", path.display()),
+            ),
+        }
+    }
+    art
+}
+
+/// Picture (or first letter) in a rounded square edged with the status color
+fn mvp_icon(ui: &mut Ui, art: Option<&egui::TextureHandle>, name: &str, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(MVP_ICON, MVP_ICON), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(7), p().panel);
+    match art {
+        Some(texture) => {
+            egui::Image::new(texture)
+                .uv(cover_uv(texture.size_vec2(), rect.size(), 0.5))
+                .corner_radius(CornerRadius::same(7))
+                .paint_at(ui, rect.shrink(1.0));
+        }
+        None => {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                monogram(name),
+                rounded(15.0),
+                p().muted,
+            );
+        }
+    }
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(7),
+        Stroke::new(1.5_f32, tint(color, 200)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Rounded chip like the library filters; `active` = already in that state (shown filled)
+fn toolbar_chip(ui: &mut Ui, label: &str, active: bool) -> bool {
+    let text =
+        RichText::new(label)
+            .small()
+            .semibold()
+            .color(if active { p().bg } else { p().text });
+    let button = egui::Button::new(text)
+        .fill(if active { p().blue } else { p().panel })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if active { p().blue } else { p().border },
+        ))
+        .corner_radius(CornerRadius::same(99))
+        .min_size(egui::vec2(0.0, 24.0));
+    ui.add(button).clicked()
+}
+
+/// "Clear timers" asks for a second click within 4 s, so one stray click can't wipe them
+fn clear_button(ui: &mut Ui) -> bool {
+    let id = egui::Id::new("clear-mvp-timers");
+    let now = ui.input(|input| input.time);
+    let armed = ui
+        .data(|data| data.get_temp::<f64>(id))
+        .is_some_and(|at| now - at < 4.0);
+    let (label, color) = if armed {
+        ("Click again to clear", p().amber)
+    } else {
+        ("Clear timers", p().muted)
+    };
+    let button = egui::Button::new(RichText::new(label).small().semibold().color(color))
+        .fill(if armed {
+            tint(p().amber, 30)
+        } else {
+            p().panel
+        })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if armed { p().amber } else { p().border },
+        ))
+        .corner_radius(CornerRadius::same(99))
+        .min_size(egui::vec2(0.0, 24.0));
+    let response = ui.add(button).on_hover_text(
+        "Forget every MVP timer and start counting again from the next announcements. \
+         Use it after Gamepulse or the tracker was off for a while.",
+    );
+    if !response.clicked() {
+        return false;
+    }
+    if armed {
+        ui.data_mut(|data| data.remove::<f64>(id));
+        true
+    } else {
+        ui.data_mut(|data| data.insert_temp(id, now));
+        false
+    }
+}
+
+/// MVP tracker: on/off, and every MVP with its next spawn and an alert checkbox
+fn mvp_section(ui: &mut Ui, engine: &mut Engine, art: &MvpArt) {
+    ui.add_space(16.0);
+    let on = engine.boss_watch.is_some();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("MVP tracker").size(16.0).semibold());
+        ui.add_space(4.0);
+        let (status, color) = engine.boss_status();
+        pill(ui, &status, color);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let (label, fill, text) = if on {
+                ("Turn off", p().card, p().text)
+            } else {
+                ("Turn on", p().green, p().on_green)
+            };
+            let button = egui::Button::new(RichText::new(label).semibold().color(text))
+                .fill(fill)
+                .min_size(egui::vec2(96.0, 28.0));
+            let hover = if on {
+                "Stop reading the game window (no CPU used while off)"
+            } else {
+                "Read the game's MVP announcements from its window once a second"
+            };
+            if ui.add(button).on_hover_text(hover).clicked() {
+                engine.set_boss_tracker(!on);
+            }
+            let route = engine.route_open();
+            let label = if route {
+                "Close route window"
+            } else {
+                "Route window"
+            };
+            if ui
+                .add(egui::Button::new(label).min_size(egui::vec2(0.0, 28.0)))
+                .on_hover_text(
+                    "A small window that stays on top of the game: which MVP to go for first, \
+                     then next, by spawn time. Right-click it to show ticked or all MVPs",
+                )
+                .clicked()
+            {
+                engine.toggle_route();
+            }
+        });
+    });
+    match (&engine.boss_problem, on) {
+        (_, false) => hint(
+            ui,
+            "Off: nothing is captured. Timers below are from the last time it ran.",
+            p().muted,
+        ),
+        (Some(problem), true) if problem != "Starting..." => hint(ui, problem, p().amber),
+        _ => hint(
+            ui,
+            "Every MVP respawns 1 hour after it dies. Ticked MVPs alert as set in Settings › MVP tracker.",
+            p().muted,
+        ),
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        for (color, label) in [
+            (p().green, "up"),
+            (p().amber, "30% HP"),
+            (p().blue, "spawns soon"),
+            (p().red, "dead"),
+            (p().muted, "not seen yet"),
+        ] {
+            dot(ui, color, 3.5);
+            ui.label(RichText::new(label).small().color(p().muted));
+            ui.add_space(6.0);
+        }
+    });
+    ui.add_space(4.0);
+    let rows = engine.boss_rows();
+    let mut toggled: Option<(&'static str, bool)> = None;
+    let mut all: Option<bool> = None;
+    let mut clear = false;
+    let ticked = rows.iter().filter(|r| r.tracked).count();
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Alerts for {ticked} of {} MVPs", rows.len()))
+                    .color(p().muted),
+            );
+            ui.add_space(6.0);
+            if toolbar_chip(ui, "Tick all", ticked == rows.len()) {
+                all = Some(true);
+            }
+            if toolbar_chip(ui, "Untick all", ticked == 0) {
+                all = Some(false);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                clear = clear_button(ui);
+            });
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+        egui::Grid::new("mvps")
+            .num_columns(3)
+            .spacing([18.0, 7.0])
+            .show(ui, |ui| {
+                for row in &rows {
+                    let mut tracked = row.tracked;
+                    ui.horizontal(|ui| {
+                        mvp_icon(ui, art.get(row.name), row.name, row.color);
+                        if ui
+                            .checkbox(&mut tracked, RichText::new(row.name).semibold())
+                            .on_hover_text("Send alerts for this MVP")
+                            .changed()
+                        {
+                            toggled = Some((row.name, tracked));
+                        }
+                    });
+                    ui.label(RichText::new(row.map).color(p().muted));
+                    ui.horizontal(|ui| {
+                        dot(ui, row.color, 3.5);
+                        let color = if row.color == p().muted {
+                            p().muted
+                        } else {
+                            p().text
+                        };
+                        ui.label(RichText::new(&row.status).color(color));
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+    if clear {
+        engine.clear_boss_timers();
+    }
+    if let Some((name, on)) = toggled {
+        engine.set_boss_tracked(name, on);
+    }
+    if let Some(on) = all {
+        engine.set_all_bosses_tracked(on);
+    }
+}
+
 pub(super) fn game_page(
     ui: &mut Ui,
     engine: &mut Engine,
     game: &'static GameProfile,
     cover: Option<&Cover>,
+    art: &MvpArt,
 ) -> Option<Action> {
     let mut action = library_button(ui).then_some(Action::Back);
     ui.add_space(6.0);
-    if let Some(header) = game_header(ui, engine, game, cover) {
-        action = Some(header);
-    }
-    ui.add_space(12.0);
-
     let cards = engine.cards(game);
     let mut clicked = None;
-    ui.label(RichText::new("Clients").size(16.0).semibold());
-    ui.add_space(4.0);
+    // The banner scrolls with the page: scrolling down to the MVP tracker pushes it off the top
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            if let Some(header) = game_header(ui, engine, game, cover) {
+                action = Some(header);
+            }
+            ui.add_space(12.0);
+            ui.label(RichText::new("Clients").size(16.0).semibold());
+            ui.add_space(4.0);
             match &engine.snapshot {
                 None => {
                     ui.horizontal(|ui| {
@@ -713,6 +976,9 @@ pub(super) fn game_page(
                 );
             }
             snapshot_notes(ui, engine);
+            if !game.mvps.is_empty() {
+                mvp_section(ui, engine, art);
+            }
         });
     match clicked {
         Some((identity, CardAction::Pin(on))) => engine.set_pinned(identity, on),
@@ -738,6 +1004,12 @@ mod tests {
         // Wide image into a narrow frame: crop left/right equally
         let wide = cover_uv(egui::vec2(1920.0, 1080.0), egui::vec2(180.0, 240.0), 0.5);
         assert!((wide.min.x - (1.0 - wide.max.x)).abs() < 1e-4 && wide.height() == 1.0);
+    }
+
+    #[test]
+    fn mvp_picture_names_match_rooc_kit() {
+        assert_eq!(mvp_file_name("Golden Thief Bug"), "golden-thief-bug");
+        assert_eq!(mvp_file_name("Moonlight Flower"), "moonlight-flower");
     }
 
     #[test]

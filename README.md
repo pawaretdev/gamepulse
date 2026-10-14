@@ -1,6 +1,6 @@
-<p align="center"><img src="assets/icon-256.png" width="128" alt="GamePulse icon"></p>
+<p align="center"><img src="assets/icon-256.png" width="128" alt="Gamepulse icon"></p>
 
-<h1 align="center">GamePulse</h1>
+<h1 align="center">Gamepulse</h1>
 
 <p align="center"><b>English</b> · <a href="README.th.md">ภาษาไทย</a></p>
 
@@ -11,9 +11,10 @@ A small Windows tray app that watches your game clients and alerts your phone th
 - Never reads game memory, clicks anything or touches your account
 - Keeps watching from the system tray when you close the window
 - Pin a game window on top, or keep it in a floating picture-in-picture view while you work
+- Optional **MVP tracker**: reads the game's own MVP announcements from its window and warns you on Discord or with a Windows notification before each MVP respawns
 
 <p align="center">
-  <img src="docs/library.png" width="49%" alt="GamePulse game library with alerts on and both clients online">
+  <img src="docs/library.png" width="49%" alt="Gamepulse game library with alerts on and both clients online">
   <img src="docs/game.png" width="49%" alt="Game page showing each client's connection and session time">
 </p>
 
@@ -29,7 +30,7 @@ Also set Windows **Power & sleep** to **Never**, or the PC sleeps and the game a
 
 ## Documentation
 
-- [User guide](docs/guide.md): the main screen, settings, covers, updating, uninstalling, command line
+- [User guide](docs/guide.md): the main screen, settings, MVP tracker, covers, updating, uninstalling, command line
 - [Phone setup](docs/phone-setup.md): make Android or iPhone actually wake you up
 - [How it works](docs/how-it-works.md): how disconnects are detected, when you get alerted, limitations
 - [DEVELOPMENT.md](DEVELOPMENT.md): building from source and publishing releases

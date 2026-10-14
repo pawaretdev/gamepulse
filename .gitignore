@@ -3,10 +3,14 @@
 
 # secrets / local state
 config.json
+# MVP tracker timers
+bosses.json
 *.log
 screenshots/
 # User-supplied game covers (publisher-copyrighted art, never commit)
 /covers/
+# User-supplied MVP pictures (game art, never commit)
+/mvps/
 /evidence/
 
 # local AI assistant notes

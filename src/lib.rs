@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
+pub mod boss;
+
 #[cfg(windows)]
 pub mod notify;
 
@@ -75,6 +77,20 @@ pub struct Config {
     pub watched_games: Vec<String>,
     /// Whether first-run setup is done (old configs without this key = false)
     pub onboarded: bool,
+    /// MVP tracker running (reads the game window every second; off = no capture, no CPU)
+    pub boss_tracker: bool,
+    /// `boss::Mvp::name`s that alert; unknown names are ignored
+    pub tracked_bosses: Vec<String>,
+    /// Minutes before a predicted spawn to warn; 0 = off
+    pub boss_lead_min: u64,
+    pub boss_alert_spawn: bool,
+    pub boss_alert_death: bool,
+    pub boss_alert_low_hp: bool,
+    /// MVP alerts go to the Discord webhook and/or a Windows notification, not to ntfy/Telegram
+    pub boss_discord: bool,
+    pub boss_toast: bool,
+    /// MVP route window lists every MVP instead of only the ticked ones
+    pub boss_route_all: bool,
 }
 
 impl Default for Config {
@@ -99,6 +115,19 @@ impl Default for Config {
             theme: "Midnight".into(),
             watched_games: vec![GAMES[0].id.into()],
             onboarded: false,
+            boss_tracker: false,
+            tracked_bosses: GAMES
+                .iter()
+                .flat_map(|g| g.mvps)
+                .map(|m| m.name.to_string())
+                .collect(),
+            boss_lead_min: 10,
+            boss_alert_spawn: true,
+            boss_alert_death: false,
+            boss_alert_low_hp: false,
+            boss_discord: true,
+            boss_toast: true,
+            boss_route_all: false,
         }
     }
 }
@@ -111,6 +140,17 @@ impl Config {
     /// Watched games, in `GAMES` order
     pub fn watched(&self) -> Vec<&'static GameProfile> {
         GAMES.iter().filter(|g| self.watches(g.id)).collect()
+    }
+
+    pub fn tracks_boss(&self, name: &str) -> bool {
+        self.tracked_bosses.iter().any(|tracked| tracked == name)
+    }
+
+    pub fn set_boss_tracked(&mut self, name: &str, on: bool) {
+        self.tracked_bosses.retain(|tracked| tracked != name);
+        if on {
+            self.tracked_bosses.push(name.to_string());
+        }
     }
 
     /// Turn watching a game on/off, keeping `GAMES` order and dropping unknown ids
@@ -164,6 +204,8 @@ pub struct GameProfile {
     pub exe: &'static str,
     /// Remote ports not counted as game connections (web/launcher/patch)
     pub ignored_ports: &'static [u16],
+    /// Field MVPs for the MVP tracker; empty = the game has no tracker
+    pub mvps: &'static [boss::Mvp],
 }
 
 pub const GAMES: &[GameProfile] = &[GameProfile {
@@ -171,6 +213,7 @@ pub const GAMES: &[GameProfile] = &[GameProfile {
     name: "Ragnarok Origin Classic",
     exe: "rooc.exe",
     ignored_ports: &[80, 443, 8080],
+    mvps: boss::ROOC_MVPS,
 }];
 
 pub fn find_game(id: &str) -> Option<&'static GameProfile> {
@@ -252,6 +295,26 @@ mod tests {
         assert!(config.watched_games.is_empty() && !config.watches("rooc"));
         config.set_watched("rooc", true);
         assert_eq!(config.watched_games, ["rooc"]);
+    }
+
+    #[test]
+    fn old_configs_get_the_mvp_tracker_off_with_every_mvp_tracked() {
+        let mut config: Config = serde_json::from_str(r#"{"NtfyTopic":"t"}"#).unwrap();
+        assert!(!config.boss_tracker);
+        assert_eq!(config.tracked_bosses.len(), boss::ROOC_MVPS.len());
+        assert!(config.tracks_boss("Maya"));
+        config.set_boss_tracked("Maya", false);
+        assert!(!config.tracks_boss("Maya"));
+        config.set_boss_tracked("Maya", true);
+        config.set_boss_tracked("Maya", true);
+        assert_eq!(
+            config
+                .tracked_bosses
+                .iter()
+                .filter(|n| *n == "Maya")
+                .count(),
+            1
+        );
     }
 
     #[test]

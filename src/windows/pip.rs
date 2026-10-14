@@ -47,7 +47,7 @@ use windows::Win32::{
     },
 };
 
-const CLASS: PCWSTR = w!("GamePulsePip");
+const CLASS: PCWSTR = w!("GamepulsePip");
 const TIMER: usize = 1;
 const MENU_BACK: usize = 1;
 const MENU_CLOSE: usize = 2;

@@ -2,7 +2,7 @@
 
 ## Project goal
 
-GamePulse (formerly ROOC Monitor) is a Windows-only tray app that watches game clients, because a game can drop in the middle of the night while the player is asleep. The core job is to detect disconnects and alert the player's phone reliably (ntfy / Discord webhook / Telegram), and to leave enough evidence to review afterwards. Detection and alert correctness come before cosmetic features.
+Gamepulse (formerly ROOC Monitor) is a Windows-only tray app that watches game clients, because a game can drop in the middle of the night while the player is asleep. The core job is to detect disconnects and alert the player's phone reliably (ntfy / Discord webhook / Telegram), and to leave enough evidence to review afterwards. Detection and alert correctness come before cosmetic features.
 
 Supported games are data in `GAMES` (`src/lib.rs`). Currently only Ragnarok Origin Classic (`rooc.exe`) is listed. Never hard-code game names, exe names, server IPs or ports outside `GAMES`. Profile `id`s are persisted (in config and cover filenames), so never rename them.
 

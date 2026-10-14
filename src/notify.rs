@@ -89,7 +89,7 @@ fn send_once(client: &Client, config: &Config, alert: &Alert, footer: &str) -> V
             .header(
                 "Title",
                 if title.trim().is_empty() {
-                    "GamePulse"
+                    "Gamepulse"
                 } else {
                     title.trim()
                 },
@@ -108,6 +108,23 @@ fn send_once(client: &Client, config: &Config, alert: &Alert, footer: &str) -> V
         results.push(outcome("ntfy", response));
     }
     if !config.webhook_url.trim().is_empty() {
+        results.extend(send_discord(client, config, alert, footer));
+    }
+    if !config.telegram_token.trim().is_empty() && !config.telegram_chat_id.trim().is_empty() {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            config.telegram_token.trim()
+        );
+        let payload = json!({"chat_id":config.telegram_chat_id,"text":format!("{}\n{}", alert.title, alert.message),"disable_notification":!alert.urgent});
+        results.push(outcome("telegram", client.post(url).json(&payload).send()));
+    }
+    results
+}
+
+/// Discord embed (with the heartbeat screenshot when there is one); "@here" only for urgent alerts
+fn send_discord(client: &Client, config: &Config, alert: &Alert, footer: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    {
         let fields: Vec<_> = alert
             .fields
             .iter()
@@ -145,13 +162,43 @@ fn send_once(client: &Client, config: &Config, alert: &Alert, footer: &str) -> V
         };
         results.push(outcome("discord", response));
     }
-    if !config.telegram_token.trim().is_empty() && !config.telegram_chat_id.trim().is_empty() {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            config.telegram_token.trim()
+    results
+}
+
+/// Where MVP alerts go: the Discord webhook and/or a Windows notification (not ntfy/Telegram,
+/// which are for waking you up when the game drops)
+pub fn boss_channels(config: &Config) -> Vec<&'static str> {
+    let mut result = Vec::new();
+    if config.boss_discord && !config.webhook_url.trim().is_empty() {
+        result.push("discord");
+    }
+    if config.boss_toast {
+        result.push("windows");
+    }
+    result
+}
+
+/// One message per channel: no burst, no repeat, no "@here"
+pub fn send_boss(config: Config, alert: Alert) -> Vec<String> {
+    let mut results = Vec::new();
+    if config.boss_toast {
+        results.push(
+            match crate::windows::toast::show(&alert.title, &alert.message) {
+                Ok(()) => "windows: delivered".into(),
+                Err(error) => format!("windows: {error}"),
+            },
         );
-        let payload = json!({"chat_id":config.telegram_chat_id,"text":format!("{}\n{}", alert.title, alert.message),"disable_notification":!alert.urgent});
-        results.push(outcome("telegram", client.post(url).json(&payload).send()));
+    }
+    if config.boss_discord && !config.webhook_url.trim().is_empty() {
+        match Client::builder().timeout(Duration::from_secs(20)).build() {
+            Ok(client) => results.extend(send_discord(
+                &client,
+                &config,
+                &alert,
+                "Gamepulse · MVP tracker",
+            )),
+            Err(error) => results.push(format!("HTTP client failed: {error}")),
+        }
     }
     results
 }
@@ -266,9 +313,9 @@ pub fn send_cancellable(
             }
         }
         let footer = if count > 1 {
-            format!("GamePulse · alert {index} of {count}")
+            format!("Gamepulse · alert {index} of {count}")
         } else {
-            "GamePulse".into()
+            "Gamepulse".into()
         };
         results.extend(send_once(&client, &config, &alert, &footer));
     }
@@ -290,6 +337,11 @@ mod tests {
         config.webhook_url = "secret".into();
         config.ntfy_topic = "topic".into();
         assert_eq!(channels(&config), ["ntfy", "discord"]);
+        assert_eq!(boss_channels(&config), ["discord", "windows"]);
+        config.boss_discord = false;
+        config.webhook_url.clear();
+        config.boss_toast = false;
+        assert!(boss_channels(&config).is_empty());
     }
 
     #[test]

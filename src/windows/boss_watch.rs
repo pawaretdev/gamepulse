@@ -3,6 +3,8 @@
 //!
 //! `PrintWindow(PW_RENDERFULLCONTENT)` asks the compositor for the window's own content, so it
 //! works while other windows cover the game (not while it is minimized: Windows stops drawing it).
+//! The game's power-saving mode darkens the whole picture after a while without input; the
+//! watcher brightens such frames back before reading (`dim_gain`).
 //! Nothing is sent to or read from the game process, and frames are never stored or uploaded.
 //! An elevated game only lets an elevated Gamepulse copy its window.
 //!
@@ -21,7 +23,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::Win32::{
     Foundation::{GetLastError, ERROR_ACCESS_DENIED, HWND, RECT},
@@ -40,12 +42,19 @@ const INTERVAL: Duration = Duration::from_secs(1);
 const BAR_TOP: f32 = 560.0 / 585.0;
 /// Padding around the text helps the recognizer with characters touching the edge
 const PADDING: u32 = 12;
+/// A game that is drawing never shows the exact same frame this long; when it does, Windows or
+/// the game paused rendering and `PrintWindow` keeps returning the last frame
+const STALE_AFTER: Duration = Duration::from_secs(10);
+/// In power-saving mode nothing but the centered notice is brighter than this (white → ~105)
+const DIM_MAX: u8 = 130;
 
 pub enum Reading {
     /// OCR of the whole bar, plus of its green text when it mentions "MVP"
     Text { full: String, green: String },
     /// Reading state changed: None = reading the game window, Some = why it can't
     Problem(Option<String>),
+    /// The game entered (Some(gain)) or left (None) its power-saving mode
+    Dimmed(Option<f32>),
 }
 
 pub struct Watcher {
@@ -72,6 +81,10 @@ struct Bar {
     width: u32,
     height: u32,
     bgra: Vec<u8>,
+    /// Hash of the whole client area, to notice a frozen window
+    frame: u64,
+    /// `dim_gain` the bar was brightened by (1 = normal frame)
+    gain: f32,
 }
 
 impl Bar {
@@ -106,6 +119,42 @@ fn is_text([r, g, b]: [u8; 3]) -> bool {
 /// Boss names in death announcements are green; team names are white
 fn is_green([r, g, b]: [u8; 3]) -> bool {
     g > 100 && i32::from(g) > i32::from(r) + 40 && i32::from(g) > i32::from(b) + 30
+}
+
+/// Factor that undoes the game's power-saving mode, or 1 for a normal frame. That mode multiplies
+/// every pixel by ~0.41 except a white "power saving" notice in the middle, so white text in the
+/// bar comes out ~105 and fails every text threshold. A normal frame always has bright UI
+/// (icons, names, numbers); a dimmed one has none outside the middle.
+fn dim_gain(bgra: &[u8], width: usize, height: usize) -> f32 {
+    let (left, right) = (width * 35 / 100, width * 65 / 100);
+    let (top, bottom) = (height * 60 / 100, height * 80 / 100);
+    let (mut bright, mut peak) = (0usize, 0u8);
+    for (i, p) in bgra.chunks_exact(4).enumerate() {
+        let (x, y) = (i % width, i / width);
+        if (left..right).contains(&x) && (top..bottom).contains(&y) {
+            continue;
+        }
+        let value = p[0].max(p[1]).max(p[2]);
+        if value > DIM_MAX {
+            bright += 1;
+        } else {
+            peak = peak.max(value);
+        }
+    }
+    // A few stray bright pixels are fine; a near-black frame (loading) is not dimmed, just dark
+    if bright * 10_000 > width * height || peak < 60 {
+        1.0
+    } else {
+        255.0 / f32::from(peak.max(90))
+    }
+}
+
+fn brighten(bgra: &mut [u8], gain: f32) {
+    for p in bgra.chunks_exact_mut(4) {
+        for c in &mut p[..3] {
+            *c = (f32::from(*c) * gain).round().min(255.0) as u8;
+        }
+    }
 }
 
 fn fingerprint(image: &GrayImage) -> u64 {
@@ -209,12 +258,22 @@ fn read_bar(hwnd: usize) -> Result<Bar, String> {
     {
         return Err("Windows returned a blank frame (is the game minimized?)".into());
     }
+    let mut hasher = DefaultHasher::new();
+    pixels.hash(&mut hasher);
+    let frame = hasher.finish();
+    let gain = dim_gain(&pixels, width as usize, height as usize);
     let top = ((height as f32) * BAR_TOP) as u32;
     let start = top as usize * width as usize * 4;
+    let mut bgra = pixels.split_off(start);
+    if gain > 1.0 {
+        brighten(&mut bgra, gain);
+    }
     Ok(Bar {
         width: width as u32,
         height: height as u32 - top,
-        bgra: pixels.split_off(start),
+        bgra,
+        frame,
+        gain,
     })
 }
 
@@ -254,9 +313,13 @@ fn run(game: &'static GameProfile, stop: &AtomicBool, sender: &Sender<Reading>) 
     };
     let (mut target, mut round, mut last_fingerprint, mut last_text) =
         (None, 0u32, 0u64, String::new());
+    // Last frame hash and when it last changed
+    let (mut last_frame, mut changed) = (0u64, Instant::now());
+    let mut dimmed = false;
     while !stop.load(Ordering::Relaxed) {
         // Re-pick every 10 s: a newer client may have opened, or this one closed/minimized
         if target.is_none() || round % 10 == 0 {
+            let previous = target;
             target = pick_window(game).map_or_else(
                 |error| {
                     report(Some(error));
@@ -264,15 +327,35 @@ fn run(game: &'static GameProfile, stop: &AtomicBool, sender: &Sender<Reading>) 
                 },
                 Some,
             );
+            if target != previous {
+                changed = Instant::now();
+            }
         }
         round = round.wrapping_add(1);
         if let Some(hwnd) = target {
             match read_bar(hwnd) {
                 Ok(bar) => {
-                    if !report(None) {
+                    if (bar.gain > 1.0) != dimmed {
+                        dimmed = !dimmed;
+                        let gain = dimmed.then_some(bar.gain);
+                        if sender.send(Reading::Dimmed(gain)).is_err() {
+                            return;
+                        }
+                    }
+                    if bar.frame != last_frame {
+                        (last_frame, changed) = (bar.frame, Instant::now());
+                    }
+                    let stale = changed.elapsed() >= STALE_AFTER;
+                    let problem = stale.then(|| {
+                        format!(
+                            "the game window stopped updating for {} s or more",
+                            STALE_AFTER.as_secs()
+                        )
+                    });
+                    if !report(problem) {
                         return;
                     }
-                    if bar.has_text() {
+                    if !stale && bar.has_text() {
                         let text = bar.mask(is_text);
                         let print = fingerprint(&text);
                         if print != last_fingerprint {
@@ -322,9 +405,33 @@ mod tests {
             width: 3,
             height: 1,
             bgra,
+            frame: 0,
+            gain: 1.0,
         };
         assert_eq!(bar.mask(is_text).as_raw(), &[0, 0, 255]);
         assert_eq!(bar.mask(is_green).as_raw(), &[255, 0, 255]);
+    }
+
+    /// `width`×`height` frame of `value` grey, with a white notice in the middle
+    fn frame(width: usize, height: usize, value: u8) -> Vec<u8> {
+        let mut bgra = vec![value; width * height * 4];
+        let middle = (height / 2 + height / 5) * width + width / 2;
+        bgra[middle * 4..middle * 4 + 40].fill(255);
+        bgra
+    }
+
+    #[test]
+    fn power_saving_frames_are_brightened_back() {
+        // Power-saving mode: white UI at 105, the centered notice still white
+        let gain = dim_gain(&frame(100, 60, 105), 100, 60);
+        assert!((gain - 255.0 / 105.0).abs() < 0.01);
+        let mut bar = vec![105, 105, 105, 255, 20, 20, 20, 255];
+        brighten(&mut bar, gain);
+        assert_eq!(bar, [255, 255, 255, 255, 49, 49, 49, 255]);
+        // Normal frame: bright UI everywhere
+        assert_eq!(dim_gain(&frame(100, 60, 200), 100, 60), 1.0);
+        // Loading screen: dark, not dimmed
+        assert_eq!(dim_gain(&frame(100, 60, 10), 100, 60), 1.0);
     }
 
     #[test]

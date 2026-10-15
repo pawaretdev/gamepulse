@@ -31,6 +31,11 @@ const REPEAT_SECS: u64 = 600;
 const STALE_SECS: u64 = 300;
 /// Nothing can be up this soon after it died; such sightings are misread fragments of other lines
 const DEAD_FOR_SURE_SECS: u64 = RESPAWN_SECS - 15 * 60;
+/// Of 267 logged kills, 98% died within 170 s of the 30% HP announcement (median 59 s).
+/// With no death seen this long after 30%, the death announcement was missed
+const LOW_HP_GIVE_UP_SECS: u64 = 300;
+/// A missed death is placed this long after the 30% announcement (the median)
+const LOW_HP_TO_DEATH_SECS: u64 = 60;
 
 /// Ragnarok Origin Classic field MVPs (from the rooc-kit research data; Dark Priest is a Mini),
 /// in the order the MVP list shows them
@@ -298,9 +303,12 @@ pub fn parse(mvps: &'static [Mvp], full: &str, green: &str) -> Option<(&'static 
         .skip_while(|w| !is_mvp_word(w))
         .any(|w| is_team_word(w));
     let after = boss_after_mvp(mvps, &all);
+    // Only death announcements color the boss name green, so "MVP" plus a green boss name is a
+    // death even when OCR splits the white copy of the name ("WP Ploody", "MVP P)aody Knight")
+    let green_boss = (mvp_words >= 1).then(|| find_mvp(mvps, green)).flatten();
     // The bar scrolls: one frame may show "MVP <boss>" without "... MVP Team", or the reverse
-    if mvp_words >= 2 || (mvp_words == 1 && team) || after.is_some() {
-        let mvp = find_mvp(mvps, green).or(after)?;
+    if mvp_words >= 2 || (mvp_words == 1 && team) || after.is_some() || green_boss.is_some() {
+        let mvp = green_boss.or_else(|| find_mvp(mvps, green)).or(after)?;
         return Some((mvp, Sighting::Died));
     }
     if is_noise(full) {
@@ -335,6 +343,8 @@ pub struct Timer {
     pub spawn_at: Option<u64>,
     pub up_since: Option<u64>,
     pub low_hp_at: Option<u64>,
+    /// `died_at` was guessed from a 30% HP announcement; a real death announcement replaces it
+    pub died_estimated: bool,
     /// Alerts already sent for the current `spawn_at`
     pub lead_sent: bool,
     pub spawn_sent: bool,
@@ -346,10 +356,10 @@ pub enum Status {
     Waiting {
         spawn_at: u64,
     },
-    /// `low_hp`: the game announced it at 30% HP since it came up
+    /// `low_hp_since`: when the game announced it at 30% HP, if it did since it came up
     Up {
         since: u64,
-        low_hp: bool,
+        low_hp_since: Option<u64>,
     },
 }
 
@@ -372,6 +382,11 @@ pub enum Notice {
     },
     LowHp {
         mvp: &'static str,
+    },
+    /// No death announcement seen `LOW_HP_GIVE_UP_SECS` after 30% HP: assumed dead, timer estimated
+    PresumedDead {
+        mvp: &'static str,
+        spawn_at: u64,
     },
 }
 
@@ -401,7 +416,7 @@ impl Tracker {
                 ..
             }) => Status::Up {
                 since: *since,
-                low_hp: low_hp_at.is_some_and(|at| at >= *since),
+                low_hp_since: low_hp_at.filter(|at| at >= since),
             },
             Some(Timer {
                 spawn_at: Some(at), ..
@@ -425,9 +440,10 @@ impl Tracker {
             .is_some_and(|at| now.saturating_sub(at) < DEAD_FOR_SURE_SECS);
         let mut notices = Vec::new();
         match sighting {
-            Sighting::SpawnSoon | Sighting::Spawned | Sighting::LowHp if just_died => {}
+            Sighting::SpawnSoon | Sighting::Spawned | Sighting::LowHp
+                if just_died && !timer.died_estimated => {}
             Sighting::Died => {
-                if !recent(timer.died_at) {
+                if !recent(timer.died_at) || timer.died_estimated {
                     *timer = Timer {
                         died_at: Some(now),
                         spawn_at: Some(now + RESPAWN_SECS),
@@ -487,10 +503,28 @@ impl Tracker {
     pub fn tick(&mut self, now: u64, lead_secs: u64) -> Vec<Notice> {
         let mut notices = Vec::new();
         for (name, timer) in self.timers.iter_mut() {
-            let Some(spawn_at) = timer.spawn_at else {
+            let Some(name) = self.mvps.iter().find(|m| m.name == name).map(|m| m.name) else {
                 continue;
             };
-            let Some(name) = self.mvps.iter().find(|m| m.name == name).map(|m| m.name) else {
+            if let (Some(since), Some(low)) = (timer.up_since, timer.low_hp_at) {
+                if low >= since && now >= low + LOW_HP_GIVE_UP_SECS {
+                    let died = low + LOW_HP_TO_DEATH_SECS;
+                    *timer = Timer {
+                        died_at: Some(died),
+                        spawn_at: Some(died + RESPAWN_SECS),
+                        died_estimated: true,
+                        ..Timer::default()
+                    };
+                    // Found long after the fact (the app was closed): just fix the timer quietly
+                    if now - low - LOW_HP_GIVE_UP_SECS < STALE_SECS {
+                        notices.push(Notice::PresumedDead {
+                            mvp: name,
+                            spawn_at: died + RESPAWN_SECS,
+                        });
+                    }
+                }
+            }
+            let Some(spawn_at) = timer.spawn_at else {
                 continue;
             };
             if now >= spawn_at {
@@ -593,6 +627,9 @@ mod tests {
             ("Chimora Glast Hoim", "", Some(("Chimera", Sighting::Spawned))),
             ("Chimera Perwk åö 30%!", "", Some(("Chimera", Sighting::LowHp))),
             ("Mistress 30%!", "", Some(("Mistress", Sighting::LowHp))),
+            // The white name split by OCR; the green copy names the boss
+            ("Ouåeu DojaCat WP Ploody", "Ploody Knight", Some(("Bloody Knight", Sighting::Died))),
+            ("$uånocdPlayz MVP P)aody Knight", "P)oody Knight", Some(("Bloody Knight", Sighting::Died))),
             ("Eddga HPtuecgtgk 90%! atmno: Deep Payon Forest", "", None),
             ("Dracula canyon! Canyon(168. 1", "", None),
             ("68k\"CyberTum Drake MW", "", None),
@@ -661,7 +698,7 @@ mod tests {
             tracker.status(maya),
             Status::Up {
                 since: 4592,
-                low_hp: false
+                low_hp_since: None
             }
         );
     }
@@ -694,7 +731,7 @@ mod tests {
             tracker.status(drake),
             Status::Up {
                 since: 3600,
-                low_hp: false
+                low_hp_since: None
             }
         );
     }
@@ -726,9 +763,50 @@ mod tests {
             tracker.status(dracula),
             Status::Up {
                 since: 3600,
-                low_hp: false
+                low_hp_since: None
             }
         );
+    }
+
+    #[test]
+    fn missed_death_after_low_hp_is_estimated_and_a_late_announcement_wins() {
+        let mut tracker = Tracker::new(ROOC_MVPS, BTreeMap::new());
+        let baphomet = mvp("Baphomet");
+        tracker.observe(baphomet, Sighting::LowHp, 1000, 600);
+        assert!(tracker.tick(1299, 600).is_empty());
+        assert_eq!(
+            tracker.tick(1300, 600),
+            [Notice::PresumedDead {
+                mvp: "Baphomet",
+                spawn_at: 1060 + RESPAWN_SECS
+            }]
+        );
+        assert_eq!(
+            tracker.status(baphomet),
+            Status::Waiting {
+                spawn_at: 1060 + RESPAWN_SECS
+            }
+        );
+        assert!(tracker.tick(1400, 600).is_empty());
+        // The real announcement replaces the estimate, and its repeats are ignored as usual
+        assert_eq!(
+            tracker.observe(baphomet, Sighting::Died, 1420, 600),
+            [Notice::Died {
+                mvp: "Baphomet",
+                spawn_at: 1420 + RESPAWN_SECS
+            }]
+        );
+        assert!(tracker
+            .observe(baphomet, Sighting::Died, 1425, 600)
+            .is_empty());
+    }
+
+    #[test]
+    fn old_low_hp_found_after_a_restart_is_fixed_quietly() {
+        let mut tracker = Tracker::new(ROOC_MVPS, BTreeMap::new());
+        let maya = mvp("Maya");
+        tracker.observe(maya, Sighting::LowHp, 1000, 600);
+        assert!(tracker.tick(1000 + 3 * 3600, 600).is_empty());
     }
 
     #[test]
@@ -744,7 +822,7 @@ mod tests {
             tracker.status(lord),
             Status::Up {
                 since: 50,
-                low_hp: true
+                low_hp_since: Some(50)
             }
         );
     }

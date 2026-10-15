@@ -72,6 +72,7 @@ fn mvp_probe(seconds: u64) -> ExitCode {
                 serde_json::json!({"reading": "game window"})
             }
             Ok(Reading::Problem(Some(problem))) => serde_json::json!({"problem": problem}),
+            Ok(Reading::Dimmed(gain)) => serde_json::json!({"power_saving_gain": gain}),
             Ok(Reading::Text { full, green }) => {
                 let parsed = gamepulse::boss::parse(game.mvps, &full, &green)
                     .map(|(mvp, sighting)| format!("{} {sighting:?}", mvp.name));

@@ -714,6 +714,15 @@ impl Engine {
                     }
                     self.boss_problem = problem;
                 }
+                boss_watch::Reading::Dimmed(gain) => self.push(
+                    Level::Info,
+                    match gain {
+                        Some(gain) => format!(
+                            "MVP tracker: the game is in power-saving mode; brightening it ×{gain:.1} to read"
+                        ),
+                        None => "MVP tracker: the game left power-saving mode".into(),
+                    },
+                ),
                 boss_watch::Reading::Text { full, green } => {
                     // Every reading goes to the log file only, for checking OCR later
                     Self::write_log(&local_stamp(), &format!("MVP bar: {full} | green: {green}"));
@@ -783,6 +792,17 @@ impl Engine {
                 format!("{mvp} is at 30% HP"),
                 map_of(mvp).to_string(),
                 Kind::Warn,
+            ),
+            boss::Notice::PresumedDead { mvp, spawn_at } => (
+                mvp,
+                config.boss_alert_death,
+                format!("{mvp} probably died"),
+                format!(
+                    "Its death announcement was not seen 5 min after 30% HP · respawns around {} (estimated) · {}",
+                    clock(spawn_at),
+                    map_of(mvp)
+                ),
+                Kind::Info,
             ),
         };
         self.push(Level::of_kind(kind), format!("MVP: {title} · {message}"));
@@ -870,8 +890,15 @@ impl Engine {
             }
             boss::Status::Up {
                 since,
-                low_hp: true,
-            } => (format!("30% HP · up since {}", clock(since)), p().amber),
+                low_hp_since: Some(low),
+            } => (
+                format!(
+                    "30% HP for {} · up since {}",
+                    format_duration(now.saturating_sub(low)),
+                    clock(since)
+                ),
+                p().amber,
+            ),
             boss::Status::Up { since, .. } => (format!("Up since {}", clock(since)), p().green),
             boss::Status::Unknown => ("Not seen yet".into(), p().muted),
         }
@@ -896,8 +923,9 @@ impl Engine {
             .collect()
     }
 
-    /// Where to go next: MVPs that are up (longest up first), then the rest by spawn time.
-    /// MVPs never seen since the tracker started are left out
+    /// Where to go next: MVPs at 30% HP first (most recent first: they die within minutes, so
+    /// the freshest one is the likeliest still alive), then the ones that are up (longest up
+    /// first), then the rest by spawn time. MVPs never seen since the tracker started are left out
     fn route_lines(&self) -> Vec<crate::windows::route::RouteLine> {
         let now = unix_now();
         let mut lines: Vec<((u8, u64), crate::windows::route::RouteLine)> = self
@@ -908,19 +936,22 @@ impl Engine {
             .filter_map(|mvp| {
                 let (order, when) = match self.bosses.status(mvp) {
                     boss::Status::Unknown => return None,
-                    boss::Status::Up { since, low_hp } => (
-                        (0, since),
-                        if low_hp {
-                            "30% HP".to_string()
-                        } else {
-                            format!("UP · {}", format_duration(now.saturating_sub(since)))
-                        },
+                    boss::Status::Up {
+                        low_hp_since: Some(low),
+                        ..
+                    } => (
+                        (0, u64::MAX - low),
+                        format!("30% HP · {}", format_duration(now.saturating_sub(low))),
+                    ),
+                    boss::Status::Up { since, .. } => (
+                        (1, since),
+                        format!("UP · {}", format_duration(now.saturating_sub(since))),
                     ),
                     boss::Status::Waiting { spawn_at } if spawn_at <= now => {
-                        ((0, spawn_at), "due".to_string())
+                        ((1, spawn_at), "due".to_string())
                     }
                     boss::Status::Waiting { spawn_at } => (
-                        (1, spawn_at),
+                        (2, spawn_at),
                         format!(
                             "{} · in {}",
                             clock(spawn_at),

@@ -723,6 +723,50 @@ impl Engine {
                         None => "MVP tracker: the game left power-saving mode".into(),
                     },
                 ),
+                // The game's own countdowns: they set the timers (once two readings agree), and
+                // every reading is logged for checking the OCR later
+                boss_watch::Reading::Panel {
+                    names,
+                    times,
+                    check,
+                    red,
+                } => {
+                    let read = boss::read_panel(game.mvps, &names, &times, &check, &red);
+                    for &(mvp, row) in &read {
+                        notices.extend(self.bosses.list(mvp, row, now));
+                    }
+                    let rows: Vec<String> = read
+                        .into_iter()
+                        .map(|(mvp, row)| match row {
+                            boss::PanelRow::RespawnsIn(secs) => format!(
+                                "{} in {}:{:02} (~{})",
+                                mvp.name,
+                                secs / 60,
+                                secs % 60,
+                                clock(now + secs)
+                            ),
+                            boss::PanelRow::Up => format!("{} up", mvp.name),
+                        })
+                        .collect();
+                    let raw = |lines: &[(f32, String)]| {
+                        lines
+                            .iter()
+                            .map(|(top, text)| format!("{top:.0}% {text}"))
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    };
+                    Self::write_log(
+                        &local_stamp(),
+                        &format!(
+                            "MVP panel: {} | names: {} | times: {} | check: {} | red: {:.0?}",
+                            rows.join(", "),
+                            raw(&names),
+                            raw(&times),
+                            raw(&check),
+                            red
+                        ),
+                    );
+                }
                 boss_watch::Reading::Text { full, green } => {
                     // Every reading goes to the log file only, for checking OCR later
                     Self::write_log(&local_stamp(), &format!("MVP bar: {full} | green: {green}"));
@@ -792,6 +836,21 @@ impl Engine {
                 format!("{mvp} is at 30% HP"),
                 map_of(mvp).to_string(),
                 Kind::Warn,
+            ),
+            // Only a correction of the timer: never an alert
+            boss::Notice::Listed { mvp, spawn_at, was } => (
+                mvp,
+                false,
+                match spawn_at {
+                    Some(at) => format!("{mvp} respawns around {}", clock(at)),
+                    None => format!("{mvp} is up"),
+                },
+                format!(
+                    "from the game's MVP list{} · {}",
+                    was.map_or(String::new(), |was| format!(" (was {})", clock(was))),
+                    map_of(mvp)
+                ),
+                Kind::Info,
             ),
             boss::Notice::PresumedDead { mvp, spawn_at } => (
                 mvp,
@@ -891,6 +950,7 @@ impl Engine {
             boss::Status::Up {
                 since,
                 low_hp_since: Some(low),
+                ..
             } => (
                 format!(
                     "30% HP for {} · up since {}",
@@ -898,6 +958,14 @@ impl Engine {
                     clock(since)
                 ),
                 p().amber,
+            ),
+            boss::Status::Up {
+                since,
+                since_known: false,
+                ..
+            } => (
+                format!("Up · spawn time unknown (seen up at {})", clock(since)),
+                p().green,
             ),
             boss::Status::Up { since, .. } => (format!("Up since {}", clock(since)), p().green),
             boss::Status::Unknown => ("Not seen yet".into(), p().muted),
@@ -943,9 +1011,16 @@ impl Engine {
                         (0, u64::MAX - low),
                         format!("30% HP · {}", format_duration(now.saturating_sub(low))),
                     ),
-                    boss::Status::Up { since, .. } => (
+                    // Spawn time unknown: up at least this long
+                    boss::Status::Up {
+                        since, since_known, ..
+                    } => (
                         (1, since),
-                        format!("UP · {}", format_duration(now.saturating_sub(since))),
+                        format!(
+                            "UP · {}{}",
+                            if since_known { "" } else { "≥ " },
+                            format_duration(now.saturating_sub(since))
+                        ),
                     ),
                     boss::Status::Waiting { spawn_at } if spawn_at <= now => {
                         ((1, spawn_at), "due".to_string())

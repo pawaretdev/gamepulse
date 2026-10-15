@@ -47,6 +47,15 @@ const PADDING: u32 = 12;
 const STALE_AFTER: Duration = Duration::from_secs(10);
 /// In power-saving mode nothing but the centered notice is brighter than this (white → ~105)
 const DIM_MAX: u8 = 130;
+/// Event › MVP window, as fractions of the client area (measured on 1094×585): the list's
+/// white left margin, the list of boss cards, and the rows' vertical extent
+const PANEL_MARGIN: (f32, f32) = (235.0 / 1094.0, 245.0 / 1094.0);
+const PANEL_LIST: (f32, f32) = (247.0 / 1094.0, 537.0 / 1094.0);
+const PANEL_ROWS: (f32, f32) = (134.0 / 585.0, 551.0 / 585.0);
+/// The countdown column, between the clock icon and the crown
+const PANEL_TIMES: (f32, f32) = (342.0 / 1094.0, 418.0 / 1094.0);
+/// Look for the MVP window in every client this often (rounds of `INTERVAL`)
+const PANEL_EVERY: u32 = 2;
 
 pub enum Reading {
     /// OCR of the whole bar, plus of its green text when it mentions "MVP"
@@ -55,6 +64,16 @@ pub enum Reading {
     Problem(Option<String>),
     /// The game entered (Some(gain)) or left (None) its power-saving mode
     Dimmed(Option<f32>),
+    /// The game's Event › MVP window, while one of the clients shows it: OCR lines of its list
+    /// and of its countdown column, and where that column has red text, all as tops in percent
+    /// of the list height
+    Panel {
+        names: Vec<(f32, String)>,
+        times: Vec<(f32, String)>,
+        /// The countdown column read again at another scale
+        check: Vec<(f32, String)>,
+        red: Vec<f32>,
+    },
 }
 
 pub struct Watcher {
@@ -165,7 +184,13 @@ fn fingerprint(image: &GrayImage) -> u64 {
 
 /// Upscale (the recognizer wants letters taller than the game draws them) and pad with white
 fn for_ocr(image: &GrayImage, max_side: u32) -> GrayImage {
-    let scale = 3
+    scaled_for_ocr(image, max_side, 3)
+}
+
+/// `for_ocr` at most `scale` times; a second scale makes different mistakes, so two readings
+/// that agree can be trusted where one can't
+fn scaled_for_ocr(image: &GrayImage, max_side: u32, scale: u32) -> GrayImage {
+    let scale = scale
         .min((max_side.saturating_sub(2 * PADDING)) / image.width().max(1))
         .max(1);
     let big = imageops::resize(
@@ -183,7 +208,71 @@ fn for_ocr(image: &GrayImage, max_side: u32) -> GrayImage {
     padded
 }
 
-fn read_bar(hwnd: usize) -> Result<Bar, String> {
+/// One copy of a game window's client area, BGRA top-down
+struct Frame {
+    width: usize,
+    height: usize,
+    bgra: Vec<u8>,
+}
+
+impl Frame {
+    /// The message bar along the bottom, brightened back when the game is in power-saving mode
+    fn bar(&self) -> Bar {
+        let mut hasher = DefaultHasher::new();
+        self.bgra.hash(&mut hasher);
+        let frame = hasher.finish();
+        let gain = dim_gain(&self.bgra, self.width, self.height);
+        let top = ((self.height as f32) * BAR_TOP) as usize;
+        let mut bgra = self.bgra[top * self.width * 4..].to_vec();
+        if gain > 1.0 {
+            brighten(&mut bgra, gain);
+        }
+        Bar {
+            width: self.width as u32,
+            height: (self.height - top) as u32,
+            bgra,
+            frame,
+            gain,
+        }
+    }
+
+    /// Share of near-white pixels in a rectangle given as fractions of the client area
+    fn light_share(&self, (left, right): (f32, f32), (top, bottom): (f32, f32)) -> f32 {
+        let x = |f: f32| (f * self.width as f32) as usize;
+        let y = |f: f32| (f * self.height as f32) as usize;
+        let (mut light, mut total) = (0usize, 0usize);
+        for row in (y(top)..y(bottom)).step_by(2) {
+            for column in (x(left)..x(right)).step_by(2) {
+                let i = (row * self.width + column) * 4;
+                let p = &self.bgra[i..i + 3];
+                total += 1;
+                if p.iter().all(|&c| c > 225) {
+                    light += 1;
+                }
+            }
+        }
+        light as f32 / total.max(1) as f32
+    }
+
+    /// A rectangle given as fractions of the client area, each RGB pixel mapped to grey by `shade`
+    fn region(
+        &self,
+        (left, right): (f32, f32),
+        (top, bottom): (f32, f32),
+        shade: impl Fn([u8; 3]) -> u8,
+    ) -> GrayImage {
+        let x0 = (left * self.width as f32) as u32;
+        let y0 = (top * self.height as f32) as u32;
+        let width = (right * self.width as f32) as u32 - x0;
+        let height = (bottom * self.height as f32) as u32 - y0;
+        GrayImage::from_fn(width, height, |x, y| {
+            let i = (((y0 + y) as usize) * self.width + (x0 + x) as usize) * 4;
+            Luma([shade([self.bgra[i + 2], self.bgra[i + 1], self.bgra[i]])])
+        })
+    }
+}
+
+fn capture(hwnd: usize) -> Result<Frame, String> {
     let hwnd = HWND(hwnd as *mut _);
     let mut client = RECT::default();
     unsafe { GetClientRect(hwnd, &mut client) }
@@ -258,23 +347,99 @@ fn read_bar(hwnd: usize) -> Result<Bar, String> {
     {
         return Err("Windows returned a blank frame (is the game minimized?)".into());
     }
-    let mut hasher = DefaultHasher::new();
-    pixels.hash(&mut hasher);
-    let frame = hasher.finish();
-    let gain = dim_gain(&pixels, width as usize, height as usize);
-    let top = ((height as f32) * BAR_TOP) as u32;
-    let start = top as usize * width as usize * 4;
-    let mut bgra = pixels.split_off(start);
-    if gain > 1.0 {
-        brighten(&mut bgra, gain);
-    }
-    Ok(Bar {
-        width: width as u32,
-        height: height as u32 - top,
-        bgra,
-        frame,
-        gain,
+    Ok(Frame {
+        width: width as usize,
+        height: height as usize,
+        bgra: pixels,
     })
+}
+
+/// Whether the game's Event › MVP window is open: its list has a white left margin and white
+/// cards (measured: 94% and 71% near-white; 0% on a normal or dimmed game screen)
+fn shows_mvp_panel(frame: &Frame) -> bool {
+    frame.light_share(PANEL_MARGIN, PANEL_ROWS) >= 0.8
+        && frame.light_share(PANEL_LIST, PANEL_ROWS) >= 0.5
+}
+
+fn luma([r, g, b]: [u8; 3]) -> u8 {
+    ((u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000) as u8
+}
+
+/// The countdown ("47:21") and "refreshed" text in the MVP list are pinkish red (~210,85,120):
+/// dark where a pixel is red, keeping the anti-aliased edges (a hard mask turns "1" into "T")
+fn redness([r, g, b]: [u8; 3]) -> u8 {
+    let red = (i32::from(r) - i32::from(g.max(b))).max(0) * 3;
+    255 - red.min(255) as u8
+}
+
+/// OCR lines of `image` upscaled up to `scale` times, each with its top as a percentage of the
+/// image height
+fn lines_at(ocr: &Ocr, image: &GrayImage, scale: u32) -> Option<Vec<(f32, String)>> {
+    let big = scaled_for_ocr(image, ocr.max_side(), scale);
+    let scale = (big.width() - 2 * PADDING) as f32 / image.width() as f32;
+    let lines = ocr.read_lines(&big).ok()?;
+    Some(
+        lines
+            .into_iter()
+            .map(|line| {
+                let top = (line.top - PADDING as f32) / scale / image.height() as f32 * 100.0;
+                (top, line.text)
+            })
+            .collect(),
+    )
+}
+
+/// The MVP window's list: OCR lines of the whole list and of the countdown column (read from a
+/// redness image, twice at different scales: a lone reading turns 27 into 21 now and then),
+/// tagged with their height in the list in percent. None unless at least two lines are map
+/// names (otherwise it was something else that looked white)
+fn read_mvp_panel(ocr: &Ocr, mvps: &'static [boss::Mvp], frame: &Frame) -> Option<Reading> {
+    let names = lines_at(ocr, &frame.region(PANEL_LIST, PANEL_ROWS, luma), 3)?;
+    let maps = names
+        .iter()
+        .filter(|(_, text)| boss::map_named(mvps, text).is_some())
+        .count();
+    if maps < 2 {
+        return None;
+    }
+    let red = frame.region(PANEL_TIMES, PANEL_ROWS, redness);
+    let times = lines_at(ocr, &red, 3).unwrap_or_default();
+    let check = lines_at(ocr, &red, 2).unwrap_or_default();
+    Some(Reading::Panel {
+        names,
+        times,
+        check,
+        red: red_text_tops(&red),
+    })
+}
+
+/// Tops (percent of the image height) of the runs of rows that hold red text, so a row whose
+/// countdown OCR can't read is told apart from a row with nothing red in it yet (the window
+/// is still opening) or with the Thai "refreshed" text that OCR doesn't read at all
+fn red_text_tops(image: &GrayImage) -> Vec<f32> {
+    let height = image.height();
+    let red_row = |y: u32| {
+        (0..image.width())
+            .filter(|&x| image.get_pixel(x, y).0[0] < 128)
+            .count()
+            >= 3
+    };
+    let mut tops = vec![];
+    let mut y = 0;
+    while y < height {
+        if red_row(y) {
+            let start = y;
+            while y < height && red_row(y) {
+                y += 1;
+            }
+            // Text is at least a few pixels tall; single lines are stray pixels
+            if y - start >= 4 {
+                tops.push(start as f32 / height as f32 * 100.0);
+            }
+        }
+        y += 1;
+    }
+    tops
 }
 
 /// Newest client whose window is not minimized
@@ -332,9 +497,13 @@ fn run(game: &'static GameProfile, stop: &AtomicBool, sender: &Sender<Reading>) 
             }
         }
         round = round.wrapping_add(1);
+        // This round's copy of the target window, reused when looking for the MVP window
+        let mut current: Option<(usize, Frame)> = None;
         if let Some(hwnd) = target {
-            match read_bar(hwnd) {
-                Ok(bar) => {
+            match capture(hwnd) {
+                Ok(frame) => {
+                    let bar = frame.bar();
+                    current = Some((hwnd, frame));
                     if (bar.gain > 1.0) != dimmed {
                         dimmed = !dimmed;
                         let gain = dimmed.then_some(bar.gain);
@@ -389,6 +558,30 @@ fn run(game: &'static GameProfile, stop: &AtomicBool, sender: &Sender<Reading>) 
                 }
             }
         }
+        // The MVP window can be open in any client, not only the one whose bar is read
+        if round % PANEL_EVERY == 0 {
+            for window in super::game_windows(game)
+                .unwrap_or_default()
+                .iter()
+                .filter(|w| !w.minimized)
+            {
+                let frame = match current.take() {
+                    Some((hwnd, frame)) if hwnd == window.hwnd => Some(frame),
+                    other => {
+                        current = other;
+                        capture(window.hwnd).ok()
+                    }
+                };
+                let panel = frame
+                    .filter(shows_mvp_panel)
+                    .and_then(|frame| read_mvp_panel(&ocr, game.mvps, &frame));
+                if let Some(panel) = panel {
+                    if sender.send(panel).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
         thread::sleep(INTERVAL);
     }
 }
@@ -432,6 +625,32 @@ mod tests {
         assert_eq!(dim_gain(&frame(100, 60, 200), 100, 60), 1.0);
         // Loading screen: dark, not dimmed
         assert_eq!(dim_gain(&frame(100, 60, 10), 100, 60), 1.0);
+    }
+
+    #[test]
+    fn mvp_window_is_recognized_by_its_white_list() {
+        let (width, height) = (1094, 585);
+        let mut frame = Frame {
+            width,
+            height,
+            bgra: vec![90; width * height * 4],
+        };
+        assert!(!shows_mvp_panel(&frame));
+        // White margin and cards where the game draws the list
+        for y in 134..551 {
+            for x in 235..537 {
+                let i = (y * width + x) * 4;
+                frame.bgra[i..i + 3].fill(250);
+            }
+        }
+        assert!(shows_mvp_panel(&frame));
+    }
+
+    #[test]
+    fn countdown_red_becomes_dark_and_the_rest_white() {
+        assert!(redness([210, 85, 120]) < 30);
+        assert_eq!(redness([250, 250, 250]), 255);
+        assert_eq!(redness([40, 50, 90]), 255);
     }
 
     #[test]

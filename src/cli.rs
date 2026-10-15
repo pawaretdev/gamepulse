@@ -73,6 +73,19 @@ fn mvp_probe(seconds: u64) -> ExitCode {
             }
             Ok(Reading::Problem(Some(problem))) => serde_json::json!({"problem": problem}),
             Ok(Reading::Dimmed(gain)) => serde_json::json!({"power_saving_gain": gain}),
+            Ok(Reading::Panel {
+                names,
+                times,
+                check,
+                red,
+            }) => {
+                let rows: Vec<String> =
+                    gamepulse::boss::read_panel(game.mvps, &names, &times, &check, &red)
+                        .into_iter()
+                        .map(|(mvp, row)| format!("{} {row:?}", mvp.name))
+                        .collect();
+                serde_json::json!({"mvp_panel": rows, "names": names, "times": times, "check": check, "red": red})
+            }
             Ok(Reading::Text { full, green }) => {
                 let parsed = gamepulse::boss::parse(game.mvps, &full, &green)
                     .map(|(mvp, sighting)| format!("{} {sighting:?}", mvp.name));

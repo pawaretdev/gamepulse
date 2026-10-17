@@ -40,6 +40,8 @@ const PW_RENDERFULLCONTENT: u32 = 2;
 const INTERVAL: Duration = Duration::from_secs(1);
 /// The message bar is the bottom 25 px of a 1094×585 client area; scale with the window
 const BAR_TOP: f32 = 560.0 / 585.0;
+/// Darkest channel of a white text pixel in the bar
+const TEXT_MIN: u8 = 170;
 /// Padding around the text helps the recognizer with characters touching the edge
 const PADDING: u32 = 12;
 /// A game that is drawing never shows the exact same frame this long; when it does, Windows or
@@ -112,12 +114,14 @@ impl Bar {
         [self.bgra[i + 2], self.bgra[i + 1], self.bgra[i]]
     }
 
-    /// White text pixels; the bar is empty most of the time, then there is nothing to read
+    /// White text pixels; the bar is empty most of the time, then there is nothing to read.
+    /// Under the MVP reward window ("you defeated MVP ...") the game draws the bar's white text
+    /// at ~160-200, not 255, so the cut-off sits below that
     fn has_text(&self) -> bool {
         let bright = self
             .bgra
             .chunks_exact(4)
-            .filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200)
+            .filter(|p| p[0] > TEXT_MIN && p[1] > TEXT_MIN && p[2] > TEXT_MIN)
             .count();
         bright * 150 > (self.width * self.height) as usize
     }
@@ -603,6 +607,24 @@ mod tests {
         };
         assert_eq!(bar.mask(is_text).as_raw(), &[0, 0, 255]);
         assert_eq!(bar.mask(is_green).as_raw(), &[255, 0, 255]);
+    }
+
+    #[test]
+    fn dimmed_white_text_under_the_reward_window_counts() {
+        // 1% of the bar is text at 185 grey (measured on the MVP reward window), the rest dark
+        let bar = |value: u8| {
+            let mut bgra = vec![20; 100 * 20 * 4];
+            bgra[..20 * 4].fill(value);
+            Bar {
+                width: 100,
+                height: 20,
+                bgra,
+                frame: 0,
+                gain: 1.0,
+            }
+        };
+        assert!(bar(185).has_text());
+        assert!(!bar(120).has_text());
     }
 
     /// `width`×`height` frame of `value` grey, with a white notice in the middle
